@@ -1,5 +1,9 @@
 # DOSBox-X → Ubiquitty Terminal Port — Execution Plan
 
+> **Using it?** See [TERMINAL.md](TERMINAL.md) for how to run it (the `dos`
+> launcher) and the driver's options (incl. `SDL_TERMINAL_ASPECT`). This file is
+> the design/execution plan.
+
 > Goal: make DOSBox-X render and play **inside a terminal** (Ubiquitty) via the
 > **Kitty graphics protocol**, translating terminal keyboard/mouse input back
 > into the emulator. Model: `~/Projects/terminal-doom`. Both ends are ours

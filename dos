@@ -10,11 +10,41 @@
 #
 # Runs in the current terminal; DOSBox-X's logs go to /tmp/dosbox.log so they
 # don't corrupt the Kitty image stream. Ctrl-C to quit.
+#
+# Renders at a 4:3 display aspect by default (DOS content was drawn for 4:3 CRTs,
+# so its raw pixel ratio looks wrong). Override with SDL_TERMINAL_ASPECT, e.g.
+# `SDL_TERMINAL_ASPECT=16:9 dos ...` or `SDL_TERMINAL_ASPECT=native dos ...`
+# (anything that isn't a W:H ratio or decimal falls back to filling the grid).
 
 DOSBOX="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/src/dosbox-x"
 
+usage() {
+    cat <<'EOF'
+Usage: dos <program.exe|folder> [args...]
+
+Run a DOS program inside the terminal via DOSBox-X + the SDL terminal driver.
+
+  dos PATH/TO/PROG.EXE [args...]   mount PROG's folder as C: and run PROG
+  dos PATH/TO/FOLDER               mount the folder as C: and drop to C:\>
+
+Options (environment):
+  SDL_TERMINAL_ASPECT=<spec>   display aspect to letterbox to (default 4:3).
+                               "W:H" (4:3, 16:9, 5:4) or a decimal (1.6);
+                               "native" (or any non-ratio) fills the grid.
+                                 SDL_TERMINAL_ASPECT=16:9 dos game.exe
+
+Requires a Kitty-graphics terminal (e.g. Ubiquitty, kitty, Ghostty).
+Runs in the current terminal; DOSBox-X logs go to /tmp/dosbox.log. Ctrl-C quits.
+See TERMINAL.md for details.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+esac
+
 if [ $# -lt 1 ]; then
-    echo "usage: dos <program.exe|folder> [args...]" >&2
+    usage >&2
     exit 2
 fi
 
@@ -43,4 +73,6 @@ else
     cmds+=( -c "mount c \"$dir\"" -c "c:" -c "$run" )
 fi
 
-exec env SDL_VIDEODRIVER=terminal "$DOSBOX" "${cmds[@]}" >/tmp/dosbox.log 2>&1
+aspect="${SDL_TERMINAL_ASPECT:-4:3}"
+exec env SDL_VIDEODRIVER=terminal SDL_TERMINAL_ASPECT="$aspect" \
+    "$DOSBOX" "${cmds[@]}" >/tmp/dosbox.log 2>&1

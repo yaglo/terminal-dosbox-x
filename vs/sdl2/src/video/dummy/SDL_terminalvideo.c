@@ -7,12 +7,47 @@
   inside a Kitty-graphics-capable terminal (e.g. Ubiquitty) via
   SDL_VIDEODRIVER=terminal.
 
-  Part of the terminal-dosbox-x project. Currently lives in the dummy/ dir so it
-  is picked up by SDL2's existing per-file configure glob for that directory
-  without build-system surgery; it will move to its own src/video/terminal/ dir
-  once the pipeline is proven.
+  Part of the terminal-dosbox-x project. It lives in the dummy/ dir so it is
+  picked up by SDL2's existing per-file configure glob (src/video/dummy/*.c) and
+  compiled whenever the dummy driver is enabled. Moving it to its own
+  src/video/terminal/ dir is deferred deliberately: SDL2's `configure` is a
+  tracked, generated file, so relocating would require regenerating it (a large,
+  autoconf-version-dependent diff to vendored third-party code) for no functional
+  gain. Do that only as part of an upstreaming effort.
 
   This file is compiled whenever the dummy driver is enabled.
+
+  Environment variables (all optional):
+
+    SDL_VIDEODRIVER=terminal
+        Select this driver. Required to activate it.
+
+    SDL_TERMINAL_ASPECT=<spec>
+        Force the display aspect the frame is letterboxed to. Accepts a "W:H"
+        ratio ("4:3", "16:9", "5:4") or a decimal ("1.6"). Unset or unparseable
+        => native: the image's own pixel ratio when the terminal reports pixel
+        geometry, otherwise fill the character grid. DOS content was drawn for
+        4:3 CRTs, so the `dos` launcher defaults this to "4:3". Implemented in
+        term_fit_cells(): it picks the c x r cell box whose pixel aspect matches
+        <spec>, using the cell size from TIOCGWINSZ when the terminal reports it
+        else the CSI 16t reply (default 8x16) — so it works even in terminals
+        (Ubiquitty) that report ws_xpixel/ypixel = 0.
+
+    SDL_TERMINAL_ZLIB=1
+        Opt in to zlib payload compression (kitty o=z): frames are deflated
+        before base64, cutting wire bytes for flat DOS content. libz is dlopen'd
+        at runtime (no link dependency). OFF by default because the terminal must
+        support o=z — kitty and Ghostty do; verify others (e.g. Ubiquitty) before
+        enabling. Independent of the always-on skip-unchanged-frame optimization,
+        which drops byte-identical re-renders entirely.
+
+    SDL_TERMINAL_OUT=<path>
+        Write the Kitty/escape stream to <path> instead of /dev/tty. For debug
+        capture; opened O_WRONLY|O_CREAT|O_TRUNC (a regular file), so terminal
+        window-size queries do not work through it.
+
+    SDL_TERMINAL_IN=<path>
+        Read terminal input from <path> instead of STDIN.
 */
 #include "../../SDL_internal.h"
 
@@ -37,6 +72,7 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <signal.h>
+#include <dlfcn.h>
 
 #define TERMINALVID_DRIVER_NAME "terminal"
 #define TERMINAL_SURFACE_DATA   "_SDL_TerminalSurface"
@@ -66,6 +102,33 @@ typedef struct
     int img_w, img_h;        /* last frame's image pixel size (surface w,h) */
     int cell_w, cell_h;      /* terminal cell pixel size (from CSI 16t; default 8x16) */
     int mod_shift, mod_ctrl, mod_alt; /* injected modifier state (kitty input) */
+    double forced_ar;        /* forced display aspect (SDL_TERMINAL_ASPECT); 0 = native */
+
+    /* A whole frame is built into `out` then written in one blocking flush, so
+       the kitty escape reaches the terminal as few large writes instead of many
+       small ones. (Output goes to /dev/tty, which cannot be polled for
+       writability on macOS — POLLNVAL — and stdout is the logfile, so true
+       non-blocking output would need a writer thread; blocking gives natural
+       back-pressure and is the proven path.) */
+    Uint8 *out;
+    size_t out_cap, out_len, out_off;
+
+    /* Skip-unchanged-frame: the last frame's packed RGB, to detect and drop
+       identical re-renders (static DOS screens) without touching the wire. A
+       bounded streak forces a periodic resend so the image can't desync. */
+    Uint8 *last;
+    size_t last_len, last_cap;
+    int unchanged_streak;
+
+    /* Optional zlib payload compression (kitty o=z), loaded via dlopen so no
+       link dependency is forced on SDL apps. NULL/0 unless SDL_TERMINAL_ZLIB
+       opted in and libz resolved. */
+    SDL_bool use_zlib;
+    void *zlib_handle;
+    unsigned long (*z_compressBound)(unsigned long);
+    int (*z_compress2)(Uint8 *, unsigned long *, const Uint8 *, unsigned long, int);
+    Uint8 *zbuf;
+    size_t zbuf_cap;
 } TERMINAL_State;
 
 static TERMINAL_State term;
@@ -87,6 +150,38 @@ static void term_write(const void *buf, size_t len)
         p += n;
         len -= (size_t)n;
     }
+}
+
+/* --- frame output buffer (batches a whole frame into one blocking write) --- */
+
+static void term_out_reset(void)
+{
+    term.out_len = 0;
+    term.out_off = 0;
+}
+
+static void term_out_append(const void *buf, size_t len)
+{
+    if (term.out_len + len > term.out_cap) {
+        size_t ncap = term.out_cap ? term.out_cap : 65536;
+        Uint8 *nb;
+        while (ncap < term.out_len + len)
+            ncap *= 2;
+        nb = (Uint8 *)SDL_realloc(term.out, ncap);
+        if (!nb)
+            return;                     /* OOM: frame truncated (skipped this time) */
+        term.out = nb;
+        term.out_cap = ncap;
+    }
+    SDL_memcpy(term.out + term.out_len, buf, len);
+    term.out_len += len;
+}
+
+static void term_out_flush(void)
+{
+    if (term.out_len > term.out_off)
+        term_write(term.out + term.out_off, term.out_len - term.out_off);
+    term_out_reset();
 }
 
 static void term_write_str(const char *s)
@@ -172,25 +267,44 @@ static void term_restore(void)
     if (!term.active)
         return;
     term.active = SDL_FALSE;
-    /* pop kitty keyboard flags (stops further CSI-u), disable mouse, delete all
-       kitty images (q=2: no ACK), show cursor, leave alt screen */
-    term_write_str("\x1b[?1003;1006;1016l"
+    /* Flush any buffered frame so we don't leave a dangling APC. */
+    term_out_flush();
+    /* Leading ST closes any string escape still open. Then pop kitty keyboard
+       flags (stops further CSI-u), disable mouse, delete all kitty images
+       (q=2: no ACK), show cursor, leave alt screen. */
+    term_write_str("\x1b\\\x1b[?1003;1006;1016l"
                    "\x1b[<u\x1b_Ga=d,q=2\x1b\\\x1b[?25h\x1b[?1049l");
-    /* Drain pending/in-flight input so it doesn't spill to the shell after we
-       quit — most importantly the Ctrl-C key-RELEASE event (\x1b[99;5:3u) that
-       the terminal sends just after the press we quit on. Short bounded poll so
-       we catch a release landing slightly late without ever hanging. */
+    /* Flush pending/in-flight input so it doesn't spill onto the shell prompt as
+       garbage like `9;5:3u` — the key/modifier RELEASE events the terminal
+       queued in the kitty CSI-u format (e.g. releases of keys still held when we
+       quit). A short fixed poll is not enough: those events can land a little
+       after we tear down. Instead, AFTER popping kitty keyboard above, emit a
+       DSR (cursor-position report) and read+discard input up to its reply. The
+       terminal answers the DSR only once it has processed the mode-pop, so every
+       CSI-u event queued before then is drained; anything the user does after is
+       in the shell's legacy mode (no release reports) and is harmless. */
     if (term.infd >= 0) {
         struct pollfd pfd;
-        char discard[256];
+        char discard[512];
         int rounds;
+        SDL_bool saw_reply = SDL_FALSE;
+        term_write_str("\x1b[6n"); /* DSR — reply is ESC[<row>;<col>R */
         pfd.fd = term.infd;
         pfd.events = POLLIN;
-        for (rounds = 0; rounds < 3; rounds++) {
-            if (poll(&pfd, 1, 20) <= 0 || !(pfd.revents & POLLIN))
+        for (rounds = 0; rounds < 16 && !saw_reply; rounds++) {
+            ssize_t n;
+            int i, pr;
+            pr = poll(&pfd, 1, 30);
+            if (pr < 0)
                 break;
-            if (read(term.infd, discard, sizeof(discard)) <= 0)
+            if (pr == 0 || !(pfd.revents & POLLIN))
+                continue;             /* reply may be slightly delayed; keep waiting */
+            n = read(term.infd, discard, sizeof(discard));
+            if (n <= 0)
                 break;
+            for (i = 0; i < (int)n; i++) {
+                if (discard[i] == 'R') { saw_reply = SDL_TRUE; break; }
+            }
         }
     }
     if (term.raw_active) {
@@ -267,14 +381,23 @@ static void term_leave(void)
 
 /* Compute the cell box (cols x rows) to place a WxH image into the terminal.
    ALWAYS returns an explicit cell span (like libvaxis) — a kitty placement
-   without c/r may not be drawn. When the terminal reports pixel dimensions
-   (ws_xpixel/ws_ypixel) we aspect-fit; otherwise we fall back to filling the
-   character grid (stretched, but visible). Returns SDL_FALSE only if even the
-   grid size is unknown. */
+   without c/r may not be drawn.
+
+   The DISPLAY aspect is either the image's own pixel aspect (W/H) or, when
+   SDL_TERMINAL_ASPECT forced one (e.g. 4:3 for DOS content whose non-square
+   pixels look wrong at their raw 8:5 ratio), that forced ratio. The image is
+   scaled by the terminal into the chosen cell box, so picking a 4:3 box is what
+   distorts a 320x200 frame back to the 4:3 its CRT showed.
+
+   Cell pixel size comes from the kernel winsize when present, else from the
+   CSI 16t reply (term.cell_w/h, default 8x16) — so aspect-fitting works even in
+   terminals (Ubiquitty) that report ws_xpixel/ypixel = 0. With no pixel geometry
+   AND no forced aspect we fall back to filling the grid (stretched, but visible).
+   Returns SDL_FALSE only if even the grid size is unknown. */
 static SDL_bool term_fit_cells(int W, int H, int *out_cols, int *out_rows)
 {
     struct winsize ws;
-    double cell_w, cell_h, img_ar, term_ar, tw, th;
+    double cell_w, cell_h, target_ar, term_pw, term_ph, term_ar, tw, th;
     int cols, rows;
 
     if (ioctl(term.outfd, TIOCGWINSZ, &ws) != 0)
@@ -282,31 +405,42 @@ static SDL_bool term_fit_cells(int W, int H, int *out_cols, int *out_rows)
     if (ws.ws_col == 0 || ws.ws_row == 0)
         return SDL_FALSE;
 
-    if (ws.ws_xpixel == 0 || ws.ws_ypixel == 0) {
-        /* No pixel geometry (Ubiquitty reports 0 here). Fill the grid so the
-           image is at least visible; aspect correction comes later via a
-           CSI 16t cell-size query. */
+    if (ws.ws_xpixel > 0 && ws.ws_ypixel > 0) {
+        cell_w = (double)ws.ws_xpixel / ws.ws_col;
+        cell_h = (double)ws.ws_ypixel / ws.ws_row;
+    } else if (term.forced_ar > 0.0) {
+        /* No kernel pixel geometry, but a forced aspect was requested: use the
+           cell size from the CSI 16t reply (default 8x16). */
+        cell_w = (double)term.cell_w;
+        cell_h = (double)term.cell_h;
+    } else {
+        /* No pixel geometry and no forced aspect: fill the grid so the image is
+           at least visible. */
         *out_cols = ws.ws_col;
         *out_rows = ws.ws_row;
         return SDL_TRUE;
     }
+    if (cell_w < 1.0) cell_w = 1.0;
+    if (cell_h < 1.0) cell_h = 1.0;
 
-    cell_w = (double)ws.ws_xpixel / ws.ws_col;
-    cell_h = (double)ws.ws_ypixel / ws.ws_row;
-    img_ar = (double)W / (double)H;
-    term_ar = (double)ws.ws_xpixel / (double)ws.ws_ypixel;
+    target_ar = (term.forced_ar > 0.0) ? term.forced_ar : ((double)W / (double)H);
+    term_pw = (double)ws.ws_col * cell_w;
+    term_ph = (double)ws.ws_row * cell_h;
+    term_ar = term_pw / term_ph;
 
-    if (term_ar > img_ar) { /* terminal wider than image: fit height */
-        th = ws.ws_ypixel;
-        tw = th * img_ar;
+    if (term_ar > target_ar) { /* terminal wider than target: fit height */
+        th = term_ph;
+        tw = th * target_ar;
     } else { /* fit width */
-        tw = ws.ws_xpixel;
-        th = tw / img_ar;
+        tw = term_pw;
+        th = tw / target_ar;
     }
     cols = (int)(tw / cell_w);
     rows = (int)(th / cell_h);
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
+    if (cols > (int)ws.ws_col) cols = (int)ws.ws_col;
+    if (rows > (int)ws.ws_row) rows = (int)ws.ws_row;
     *out_cols = cols;
     *out_rows = rows;
     return SDL_TRUE;
@@ -318,12 +452,16 @@ static void term_emit_frame(SDL_Surface *surface)
     int H = surface->h;
     size_t rgb_len = (size_t)W * (size_t)H * 3u;
     const size_t CHUNK = 4096;
-    size_t b64_max, b64_len, off;
+    const Uint8 *payload;
+    size_t payload_len, b64_max, b64_len, off;
+    const char *ozp = "";       /* ",o=z" when the payload is zlib-compressed */
     Uint8 *dst;
     int x, y, cols = 0, rows = 0, len;
     SDL_bool have_fit, first;
     char hdr[128];
     Uint32 id;
+
+    term_out_reset();
 
     if (rgb_len > term.rgb_cap) {
         Uint8 *nb = (Uint8 *)SDL_realloc(term.rgb, rgb_len);
@@ -345,7 +483,53 @@ static void term_emit_frame(SDL_Surface *surface)
         }
     }
 
-    b64_max = 4 * ((rgb_len + 2) / 3);
+    /* Skip-unchanged: if this frame is byte-identical to the last one we sent,
+       the terminal is already showing it — skip all the compress/base64/write
+       work (a big win for static DOS screens, menus, the C:\> prompt). A bounded
+       streak forces a periodic resend so a scrolled/dropped image can't stay
+       stale forever. */
+    if (term.last && term.last_len == rgb_len && term.unchanged_streak < 60 &&
+        SDL_memcmp(term.last, term.rgb, rgb_len) == 0) {
+        term.unchanged_streak++;
+        return;
+    }
+    term.unchanged_streak = 0;
+    if (rgb_len > term.last_cap) {
+        Uint8 *nb = (Uint8 *)SDL_realloc(term.last, rgb_len);
+        if (nb) { term.last = nb; term.last_cap = rgb_len; }
+    }
+    if (term.last_cap >= rgb_len) {
+        SDL_memcpy(term.last, term.rgb, rgb_len);
+        term.last_len = rgb_len;
+    } else {
+        term.last_len = 0;  /* couldn't cache -> always send until it fits */
+    }
+
+    /* Optional zlib payload compression (kitty o=z). Compresses the raw RGB
+       before base64, cutting wire bytes for typical flat DOS frames. Falls back
+       to the raw payload if libz is unavailable or compression fails. */
+    payload = term.rgb;
+    payload_len = rgb_len;
+    if (term.use_zlib && term.z_compress2 && term.z_compressBound) {
+        unsigned long zcap = term.z_compressBound((unsigned long)rgb_len);
+        if ((size_t)zcap > term.zbuf_cap) {
+            Uint8 *nb = (Uint8 *)SDL_realloc(term.zbuf, (size_t)zcap);
+            if (nb) {
+                term.zbuf = nb;
+                term.zbuf_cap = (size_t)zcap;
+            }
+        }
+        if (term.zbuf && term.zbuf_cap >= (size_t)zcap) {
+            unsigned long zlen = (unsigned long)term.zbuf_cap;
+            if (term.z_compress2(term.zbuf, &zlen, term.rgb, (unsigned long)rgb_len, 1) == 0) {
+                payload = term.zbuf;
+                payload_len = (size_t)zlen;
+                ozp = ",o=z";
+            }
+        }
+    }
+
+    b64_max = 4 * ((payload_len + 2) / 3);
     if (b64_max > term.b64_cap) {
         char *nb = (char *)SDL_realloc(term.b64, b64_max);
         if (!nb)
@@ -353,7 +537,7 @@ static void term_emit_frame(SDL_Surface *surface)
         term.b64 = nb;
         term.b64_cap = b64_max;
     }
-    b64_len = term_base64(term.rgb, rgb_len, term.b64);
+    b64_len = term_base64(payload, payload_len, term.b64);
 
     have_fit = term_fit_cells(W, H, &cols, &rows);
 
@@ -377,7 +561,8 @@ static void term_emit_frame(SDL_Surface *surface)
         term.image_seq = 1;
     id = term.image_seq;
 
-    term_write_str("\x1b[H");
+    /* Build the whole frame into the output buffer, then flush it non-blocking. */
+    term_out_append("\x1b[H", 3);
 
     off = 0;
     first = SDL_TRUE;
@@ -388,21 +573,21 @@ static void term_emit_frame(SDL_Surface *surface)
         if (first) {
             if (have_fit) {
                 len = SDL_snprintf(hdr, sizeof(hdr),
-                                   "\x1b_Gq=2,a=T,f=24,s=%d,v=%d,i=%u,C=1,c=%d,r=%d,m=%d;",
-                                   W, H, (unsigned)id, cols, rows, m);
+                                   "\x1b_Gq=2,a=T,f=24,s=%d,v=%d,i=%u,C=1%s,c=%d,r=%d,m=%d;",
+                                   W, H, (unsigned)id, ozp, cols, rows, m);
             } else {
                 len = SDL_snprintf(hdr, sizeof(hdr),
-                                   "\x1b_Gq=2,a=T,f=24,s=%d,v=%d,i=%u,C=1,m=%d;",
-                                   W, H, (unsigned)id, m);
+                                   "\x1b_Gq=2,a=T,f=24,s=%d,v=%d,i=%u,C=1%s,m=%d;",
+                                   W, H, (unsigned)id, ozp, m);
             }
             first = SDL_FALSE;
         } else {
             len = SDL_snprintf(hdr, sizeof(hdr), "\x1b_Gm=%d;", m);
         }
-        term_write(hdr, (size_t)len);
+        term_out_append(hdr, (size_t)len);
         if (n > 0)
-            term_write(term.b64 + off, n);
-        term_write("\x1b\\", 2);
+            term_out_append(term.b64 + off, n);
+        term_out_append("\x1b\\", 2);
         off += n;
     } while (off < b64_len);
 
@@ -412,9 +597,11 @@ static void term_emit_frame(SDL_Surface *surface)
        input and spews to the shell on exit. */
     if (term.prev_image_id != 0) {
         len = SDL_snprintf(hdr, sizeof(hdr), "\x1b_Ga=d,d=I,i=%u,q=2\x1b\\", (unsigned)term.prev_image_id);
-        term_write(hdr, (size_t)len);
+        term_out_append(hdr, (size_t)len);
     }
     term.prev_image_id = id;
+
+    term_out_flush();
 }
 
 /* ------------------------------------------------------------------ */
@@ -426,15 +613,67 @@ static int TERMINAL_UpdateWindowFramebuffer(_THIS, SDL_Window *window, const SDL
 static void TERMINAL_DestroyWindowFramebuffer(_THIS, SDL_Window *window);
 static void TERMINAL_PumpEvents(_THIS);
 
+/* Opt-in zlib payload compression (kitty o=z). dlopen'd at runtime so the driver
+   never forces a libz link dependency on host SDL apps. Off unless
+   SDL_TERMINAL_ZLIB is set to a non-"0" value AND libz resolves. Note: the
+   terminal must support o=z (kitty/Ghostty do; verify others). */
+static void term_zlib_init(void)
+{
+    const char *want = SDL_getenv("SDL_TERMINAL_ZLIB");
+    const char *names[3];
+    int i;
+
+    term.use_zlib = SDL_FALSE;
+    term.zlib_handle = NULL;
+    term.z_compress2 = NULL;
+    term.z_compressBound = NULL;
+    if (!want || !*want || (want[0] == '0' && want[1] == '\0'))
+        return;
+
+    names[0] = "libz.dylib";  /* macOS */
+    names[1] = "libz.so.1";   /* Linux */
+    names[2] = "libz.so";
+    for (i = 0; i < 3 && !term.zlib_handle; i++)
+        term.zlib_handle = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL);
+    if (!term.zlib_handle)
+        return;
+
+    *(void **)(&term.z_compress2) = dlsym(term.zlib_handle, "compress2");
+    *(void **)(&term.z_compressBound) = dlsym(term.zlib_handle, "compressBound");
+    if (term.z_compress2 && term.z_compressBound)
+        term.use_zlib = SDL_TRUE;
+}
+
 static int TERMINAL_VideoInit(_THIS)
 {
     SDL_DisplayMode mode;
     struct winsize ws;
+    const char *aspect;
     int w = 640, h = 480;
 
     term.cell_w = 8; /* sane defaults until the CSI 16t reply arrives */
     term.cell_h = 16;
     term.mod_shift = term.mod_ctrl = term.mod_alt = 0;
+
+    /* SDL_TERMINAL_ASPECT forces a display aspect: "W:H" (e.g. "4:3", the right
+       ratio for DOS content) or a decimal ("1.333"). Unset/invalid => native. */
+    term.forced_ar = 0.0;
+    aspect = SDL_getenv("SDL_TERMINAL_ASPECT");
+    if (aspect && *aspect) {
+        const char *colon = SDL_strchr(aspect, ':');
+        if (colon) {
+            int num = SDL_atoi(aspect);
+            int den = SDL_atoi(colon + 1);
+            if (num > 0 && den > 0)
+                term.forced_ar = (double)num / (double)den;
+        } else {
+            double v = SDL_atof(aspect);
+            if (v > 0.0)
+                term.forced_ar = v;
+        }
+    }
+
+    term_zlib_init();
     term_open_io();
     term_enter();
 
@@ -463,9 +702,26 @@ static void TERMINAL_VideoQuit(_THIS)
     term_leave();
     SDL_free(term.rgb);
     SDL_free(term.b64);
+    SDL_free(term.out);
+    SDL_free(term.zbuf);
+    SDL_free(term.last);
     term.rgb = NULL;
     term.b64 = NULL;
+    term.out = NULL;
+    term.zbuf = NULL;
+    term.last = NULL;
     term.rgb_cap = term.b64_cap = 0;
+    term.out_cap = term.out_len = term.out_off = 0;
+    term.zbuf_cap = 0;
+    term.last_len = term.last_cap = 0;
+    term.unchanged_streak = 0;
+    if (term.zlib_handle) {
+        dlclose(term.zlib_handle);
+        term.zlib_handle = NULL;
+    }
+    term.use_zlib = SDL_FALSE;
+    term.z_compress2 = NULL;
+    term.z_compressBound = NULL;
 }
 
 static int TERMINAL_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format, void **pixels, int *pitch)
