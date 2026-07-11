@@ -172,10 +172,27 @@ static void term_restore(void)
     if (!term.active)
         return;
     term.active = SDL_FALSE;
-    /* pop kitty keyboard flags, delete all kitty images (q=2: no ACK), show
-       cursor, leave alt screen */
-    term_write_str("\x1b[?1003;1006;1016l" /* disable mouse reporting */
+    /* pop kitty keyboard flags (stops further CSI-u), disable mouse, delete all
+       kitty images (q=2: no ACK), show cursor, leave alt screen */
+    term_write_str("\x1b[?1003;1006;1016l"
                    "\x1b[<u\x1b_Ga=d,q=2\x1b\\\x1b[?25h\x1b[?1049l");
+    /* Drain pending/in-flight input so it doesn't spill to the shell after we
+       quit — most importantly the Ctrl-C key-RELEASE event (\x1b[99;5:3u) that
+       the terminal sends just after the press we quit on. Short bounded poll so
+       we catch a release landing slightly late without ever hanging. */
+    if (term.infd >= 0) {
+        struct pollfd pfd;
+        char discard[256];
+        int rounds;
+        pfd.fd = term.infd;
+        pfd.events = POLLIN;
+        for (rounds = 0; rounds < 3; rounds++) {
+            if (poll(&pfd, 1, 20) <= 0 || !(pfd.revents & POLLIN))
+                break;
+            if (read(term.infd, discard, sizeof(discard)) <= 0)
+                break;
+        }
+    }
     if (term.raw_active) {
         tcsetattr(term.infd, TCSANOW, &term.saved_termios);
         term.raw_active = SDL_FALSE;
