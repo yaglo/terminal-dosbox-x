@@ -146,6 +146,7 @@ static VideoBootStrap *bootstrap[] = {
     &OFFSCREEN_bootstrap,
 #endif
 #ifdef SDL_VIDEO_DRIVER_DUMMY
+    &TERMINAL_bootstrap,
     &DUMMY_bootstrap,
 #ifdef SDL_INPUT_LINUXEV
     &DUMMY_evdev_bootstrap,

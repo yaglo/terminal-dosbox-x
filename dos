@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# dos — run a DOS program inside the terminal via DOSBox-X + the SDL terminal driver.
+#
+#   dos PATH/TO/PROG.EXE [args...]   mount PROG's folder as C: and run PROG
+#   dos PATH/TO/FOLDER               mount the folder as C: and drop to C:\>
+#
+# The mounted folder's own (possibly long) name doesn't matter — it becomes the
+# C: root. Only the program's basename is turned into a DOS 8.3 short name
+# (LONGNA~1.EXE) so it runs whether or not long-filename support is on.
+#
+# Runs in the current terminal; DOSBox-X's logs go to /tmp/dosbox.log so they
+# don't corrupt the Kitty image stream. Ctrl-C to quit.
+
+DOSBOX="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/src/dosbox-x"
+
+if [ $# -lt 1 ]; then
+    echo "usage: dos <program.exe|folder> [args...]" >&2
+    exit 2
+fi
+
+target="$1"; shift
+
+# Convert a basename to its DOS 8.3 uppercase short form.
+to83() {
+    local b="$1" name ext
+    if [[ "$b" == *.* ]]; then name="${b%.*}"; ext="${b##*.}"; else name="$b"; ext=""; fi
+    name="$(printf '%s' "$name" | tr 'a-z' 'A-Z' | tr -cd 'A-Z0-9')"
+    ext="$(printf '%s' "$ext"  | tr 'a-z' 'A-Z' | tr -cd 'A-Z0-9')"
+    [ "${#name}" -gt 8 ] && name="${name:0:6}~1"
+    ext="${ext:0:3}"
+    if [ -n "$ext" ]; then printf '%s.%s' "$name" "$ext"; else printf '%s' "$name"; fi
+}
+
+cmds=( -set output=surface -nopromptfolder )
+if [ -d "$target" ]; then
+    dir="$(cd "$target" && pwd)"
+    cmds+=( -c "mount c \"$dir\"" -c "c:" )
+else
+    dir="$(cd "$(dirname "$target")" && pwd)"
+    short="$(to83 "$(basename "$target")")"
+    run="$short"
+    [ $# -gt 0 ] && run="$short $*"
+    cmds+=( -c "mount c \"$dir\"" -c "c:" -c "$run" )
+fi
+
+exec env SDL_VIDEODRIVER=terminal "$DOSBOX" "${cmds[@]}" >/tmp/dosbox.log 2>&1
