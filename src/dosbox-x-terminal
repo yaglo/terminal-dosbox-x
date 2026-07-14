@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# dosbox-x-terminal — run dosbox-x through the terminal (kitty graphics) video
+# driver without having to set SDL_VIDEODRIVER by hand. See ../TERMINAL.md.
+set -u
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export SDL_VIDEODRIVER=terminal
+: "${SDL_TERMINAL_ASPECT:=4:3}"
+export SDL_TERMINAL_ASPECT
+
+# DOSBox-X's own log messages go to stdout/stderr by default, which would
+# otherwise interleave with the image frames written straight to the tty.
+exec "$here/dosbox-x" -set "autolock=true" "$@" >>/tmp/dosbox.log 2>&1

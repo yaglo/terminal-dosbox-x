@@ -64,9 +64,13 @@ bootstrap_full_build() {
     case "$(uname -s)" in
         Darwin)
             ensure_macos_bootstrap_deps
-            note "running ./build-macos-sdl2 (compiles zlib/libpng/freetype/SDL2/SDL2_net/dosbox-x from scratch — this can take several minutes)"
+            note "running ./build-macos-sdl2 --enable-debug=no (compiles zlib/libpng/freetype/SDL2/SDL2_net/dosbox-x from scratch — this can take several minutes)"
             [ -x ./build-macos-sdl2 ] || chmod +x ./build-macos-sdl2
-            if ! ./build-macos-sdl2 > /tmp/build-terminal-bootstrap.log 2>&1; then
+            # build-macos-sdl2 hardcodes --enable-debug=heavy; override it here so a
+            # fresh bootstrap gets a release build instead of C_HEAVY_DEBUG (which adds
+            # a breakpoint check on every dynrec block and logs via real write() calls
+            # even in normal code paths — measurable overhead, not just debugger cost).
+            if ! ./build-macos-sdl2 --enable-debug=no > /tmp/build-terminal-bootstrap.log 2>&1; then
                 echo "full bootstrap build FAILED — errors:" >&2
                 grep -iE "error:|Error [0-9]|configure: error|failed to complete" /tmp/build-terminal-bootstrap.log >&2
                 echo "(full log: /tmp/build-terminal-bootstrap.log)" >&2
@@ -125,4 +129,8 @@ if [ -z "$frame" ]; then
 fi
 echo "    OK  ($bytes bytes, frame: $frame)"
 
-echo "==> done — src/dosbox-x is ready"
+if [ -x src/dosbox-x-terminal ]; then
+    echo "==> done — src/dosbox-x is ready (run src/dosbox-x-terminal to skip setting SDL_VIDEODRIVER by hand)"
+else
+    echo "==> done — src/dosbox-x is ready (note: src/dosbox-x-terminal wrapper is missing)"
+fi
