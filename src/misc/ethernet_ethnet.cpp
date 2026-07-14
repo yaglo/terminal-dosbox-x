@@ -56,7 +56,6 @@ struct PackedIP {
 	Uint16 port;
 } GCC_ATTRIBUTE(packed);
 
-#define SOCKETTABLESIZE 16
 #define CONVIP(hostvar) hostvar & 0xff, (hostvar >> 8) & 0xff, (hostvar >> 16) & 0xff, (hostvar >> 24) & 0xff
 #define CONVIPX(hostvar) hostvar[0], hostvar[1], hostvar[2], hostvar[3], hostvar[4], hostvar[5]
 
@@ -73,19 +72,35 @@ static IPaddress ethnetServerIp;  // IPAddress for server's listening port
 static IPaddress ethnetServConnIp;			// IPAddress for client connection to server
 static UDPsocket ethnetServerSocket;  // Listening server socket
 static UDPsocket ethnetClientSocket;
+static uint32_t ethnetServerTimeoutCheck = 0;
 //static uint8_t recvBuffer[ETHNETBUFFERSIZE];	// Incoming packet buffer
 
 static packetBuffer incomingPacket;
 
+struct l2tp_ethernet_mac_addr_t {
+	unsigned char		a[6]={0};
+};
+
 struct l2tp_client_t {
-	uint32_t		control_connection_id = 0;
+	struct l2tp_ethernet_mac_addr_t their_mac_address;
+	struct l2tp_ethernet_mac_addr_t my_mac_address;
+	uint32_t		their_control_connection_id = 0;
+	uint32_t		my_control_connection_id = 0;
 	uint32_t		router_id = 0;
 	uint16_t		Ns = 0,Nr = 0;
-	bool			active = false;
+	uint32_t		timeout = 0;
+	uint32_t		hello = 0;
+	uint32_t		hello_accept = 0;
+	uint32_t		their_session_id = 0;
+	uint32_t		my_session_id = 0;
 	IPaddress		clientIP;
+	bool			active = false;
+	bool			call_active = false;
+	bool			ethpkt_ok = false;
 };
 
 #define MAX_CLIENTS		(64)
+#define SOCKETTABLESIZE		MAX_CLIENTS
 
 static l2tp_client_t l2tp_client[MAX_CLIENTS];
 
@@ -114,6 +129,7 @@ struct l2tp_client_t *new_client_by_ip(const IPaddress &ip) {
 		}
 		else {
 			*c = l2tp_client_t();
+			c->timeout = GetTicks() + 15000;
 			c->clientIP = ip;
 			c->active = true;
 			return c;
@@ -138,31 +154,41 @@ bool EthnetEthernetConnection::Initialize(Section* config)
 	return true;
 }
 
-void EthnetEthernetConnection::SendPacket(const uint8_t* packet, int len)
-{
-	(void)packet;
-	(void)len;
-}
-
-void EthnetEthernetConnection::GetPackets(std::function<void(const uint8_t*, int)> callback)
-{
-	(void)callback;
-}
-
 bool ETHNET_isConnectedToServer(Bits tableNum, IPaddress ** ptrAddr) {
-	(void)tableNum;
-	(void)ptrAddr;
-	return false;
+	if(tableNum >= SOCKETTABLESIZE) return false;
+	*ptrAddr = &l2tp_client[tableNum].clientIP;
+	return l2tp_client[tableNum].active;
 }
+
+// WARNING: This is a non-standard protocol loosely based on L2TP (Layer 2 Tunneling Protocol).
+//          If there is any interest in making this work with other standard L2TP ethernet tunneling implementations,
+//          patches are welcome.
 
 static uint16_t l2tp_ns = 0;
 static uint16_t l2tp_nr = 0;
+static struct l2tp_ethernet_mac_addr_t l2tp_cli_mac_addr;
+static struct l2tp_ethernet_mac_addr_t l2tp_svr_mac_addr;
 static uint32_t l2tp_cli_control_connection_id = 0;/*NTS: L2TPv2 defines this as 16:16 tunnel_id:session_id*/
 static uint32_t l2tp_svr_control_connection_id = 0;
+static uint32_t l2tp_cli_session_id = 0;/*NTS: L2TPv2 defines this as 16:16 tunnel_id:session_id*/
+static uint32_t l2tp_svr_session_id = 0;
 static uint32_t l2tp_cli_router_id = 0;/*NTS: L2TPv2 defines this as 16:16 tunnel_id:session_id*/
 static uint32_t l2tp_svr_router_id = 0;
+static uint32_t l2tp_cli_hello = 0;
+static uint32_t l2tp_cli_timeout = 0;
+static uint32_t l2tp_cli_hello_accept = 0;
+static bool l2tp_ethpkt_ok = false;
 
-static void l2tp_ctrlmsg_hdr(unsigned char* &w,unsigned char *wf,uint32_t ctrl_conn_id) {
+static void l2tp_datamsg_hdr(unsigned char* &w,unsigned char *wf,uint32_t session_id) {
+	if ((w+12) > wf) return;
+
+	*w++ = 0x00;/* Txxxxxxx T=0 */
+	*w++ = 3;
+	*((uint16_t*)w) = 0; w+=2; /* reserved */
+	*((uint32_t*)w) = htobe32(session_id); w+=4; /* Control Connection ID */
+}
+
+static void l2tp_ctrlmsg_hdr(unsigned char* &w,unsigned char *wf,uint32_t ctrl_conn_id,uint16_t ns,uint16_t nr) {
 	if ((w+12) > wf) return;
 
 	/* [https://www.rfc-editor.org/info/rfc3931/#section-3.2.1] */
@@ -170,8 +196,8 @@ static void l2tp_ctrlmsg_hdr(unsigned char* &w,unsigned char *wf,uint32_t ctrl_c
 	*w++ = 3;
 	*((uint16_t*)w) = 0; w+=2; /* length (set to 0 for now) */
 	*((uint32_t*)w) = htobe32(ctrl_conn_id); w+=4; /* Control Connection ID */
-	*((uint16_t*)w) = htobe16(l2tp_ns); w+=2;
-	*((uint16_t*)w) = htobe16(l2tp_nr); w+=2;
+	*((uint16_t*)w) = htobe16(ns); w+=2;
+	*((uint16_t*)w) = htobe16(nr); w+=2;
 }
 
 static void l2tp_ctrlmsg_hdr_update(unsigned char *base,unsigned char* &w,unsigned char *wf) {
@@ -203,6 +229,12 @@ static void l2tp_avp_end(unsigned char *base,unsigned char* &w,unsigned char *wf
 # define AVP_CTRL_MSG_TYPE_SCCRQ                    1
 # define AVP_CTRL_MSG_TYPE_SCCRP                    2
 # define AVP_CTRL_MSG_TYPE_SCCCN                    3
+# define AVP_CTRL_MSG_TYPE_StopCCN                  4
+# define AVP_CTRL_MSG_TYPE_HELLO                    6
+# define AVP_CTRL_MSG_TYPE_ICRQ                     10
+# define AVP_CTRL_MSG_TYPE_ICRP                     11
+# define AVP_CTRL_MSG_TYPE_ICCN                     12
+# define AVP_CTRL_MSG_TYPE_ACK                      20
 #define AVP_CTRL_FRAMING_CAPS                       3
 #define AVP_CTRL_HOST_NAME                          7
 #define AVP_CTRL_VENDOR_NAME                        8
@@ -213,9 +245,15 @@ static void l2tp_avp_end(unsigned char *base,unsigned char* &w,unsigned char *wf
 #define AVP_CTRL_ASSN_LOCAL_SESSION_ID              63
 #define AVP_CTRL_ASSN_REMOTE_SESSION_ID             64
 
+/* L2TP AVPs have a vendor ID field---use it for our extensions */
+#define AVP_VENDOR_ID_DOSBOX                        0xD05B
+# define AVP_CTRL_MSG_DOSBOX_MAC_ADDRESS            0x4000 /* client/server: provide each other the ethernet MAC address of the network card for routing purposes */
+
 struct L2TPpacket {
+	/* NTS: There is nothing in this struct that requires a custom move or copy constructor---yet */
 	std::vector<unsigned char>		raw; /* this is a way for the data to persist if desired */
 	bool					iscontrol=false; /*T*/
+	bool					isdata=false; /*T*/
 	bool					didrecv=false;
 	size_t					read=0;
 	size_t					write=0;
@@ -225,6 +263,7 @@ struct L2TPpacket {
 	uint16_t				Ns=0,Nr=0;
 	uint16_t				length=0;
 	uint32_t				use_connection_id=0;
+	uint32_t				use_session_id=0;
 
 	struct avp_t {
 		bool				M=false;
@@ -236,7 +275,7 @@ struct L2TPpacket {
 	};
 
 	std::vector<struct avp_t>		recv_avp;//WARNING: points at buffer on recv, invalidated on resize
-	std::map<uint16_t,uint16_t>		recv_avp_map;//NTS: There is no way any packet would have more than 0xFFFF AVPs!
+	std::map<uint32_t/*vendor:attr*/,uint16_t> recv_avp_map;//NTS: There is no way any packet would have more than 0xFFFF AVPs!
 
 	L2TPpacket &clear(void) {
 		raw.clear();
@@ -247,6 +286,12 @@ struct L2TPpacket {
 		length_field=0;
 		seq_field=0;
 		use_connection_id=0;
+		use_session_id=0;
+		return *this;
+	}
+	L2TPpacket &setseq(const uint16_t ns,const uint16_t nr) {
+		Ns=ns;
+		Nr=nr;
 		return *this;
 	}
 	L2TPpacket &needs(const size_t sz) {//invalidates pointers!
@@ -289,6 +334,23 @@ struct L2TPpacket {
 		return raw.size()-read;
 	}
 
+	L2TPpacket &session_id(const uint32_t sid) {
+		use_session_id = sid;
+		return *this;
+	}
+	uint32_t session_id(void) {
+		return use_session_id;
+	}
+
+	L2TPpacket &rewrite_session_id(void) {
+		if (isdata && read >= 8 && raw.size() >= 8) {
+			unsigned char *p = raw.data()+4;
+			*((uint32_t*)p) = htobe32(use_session_id);
+		}
+
+		return *this;
+	}
+
 	L2TPpacket &connection_id(const uint32_t cid) {
 		use_connection_id = cid;
 		return *this;
@@ -303,7 +365,18 @@ struct L2TPpacket {
 			iscontrol=true;
 			needsmore(12);
 			unsigned char *w = writeptr();
-			l2tp_ctrlmsg_hdr(w,writefence(),use_connection_id);
+			l2tp_ctrlmsg_hdr(w,writefence(),use_connection_id,Ns,Nr);
+			writeptrupdate(w);
+		}
+
+		return *this;
+	}
+	L2TPpacket &begin_data(void) {
+		if (write == 0) {
+			isdata=true;
+			needsmore(12);
+			unsigned char *w = writeptr();
+			l2tp_datamsg_hdr(w,writefence(),use_session_id);
 			writeptrupdate(w);
 		}
 
@@ -339,8 +412,9 @@ struct L2TPpacket {
 		return *this;
 	}
 
-	struct avp_t *recv_lookup_avp(const uint16_t a) {
-		auto i = recv_avp_map.find(a);
+	struct avp_t *recv_lookup_avp(const uint16_t a,const uint16_t v=0) {
+		const uint32_t key = a | (v << 16u);
+		auto i = recv_avp_map.find(key);
 		if (i != recv_avp_map.end() && i->second < recv_avp.size()) return &recv_avp[i->second];
 		return NULL;
 	}
@@ -407,6 +481,66 @@ struct L2TPpacket {
 		return 0;
 	}
 
+	L2TPpacket &avp_local_session_id(const uint32_t ccid) {
+		needsmore(32);
+		unsigned char *w = writeptr(),*ab = w,*wf = writefence();
+		l2tp_avp_begin(w,wf,/*mandatory*/false,/*vendor*/0,/*attribute type*/AVP_CTRL_ASSN_LOCAL_SESSION_ID);//FIXME: xl2tpd doesn't like this send as mandatory??
+		*((uint32_t*)w) = htobe32(ccid);w+=4;
+		l2tp_avp_end(ab,w,wf);
+		writeptrupdate(w);
+		return *this;
+	}
+	uint32_t avp_local_session_id(void) {
+		struct avp_t *avp = recv_lookup_avp(AVP_CTRL_ASSN_LOCAL_SESSION_ID);
+		if (avp && avp->length >= 4) {
+			unsigned char *r = avp->data,*rf = avp->data+avp->length;
+			uint32_t ccid = be32toh(*((uint32_t*)r)); r+=4;
+			assert(r <= rf);
+			return ccid;
+		}
+		return 0;
+	}
+
+	L2TPpacket &avp_dosbox_mac_address(const struct l2tp_ethernet_mac_addr_t &ema) {
+		needsmore(48);
+		unsigned char *w = writeptr(),*ab = w,*wf = writefence();
+		l2tp_avp_begin(w,wf,/*mandatory*/false,/*vendor*/AVP_VENDOR_ID_DOSBOX,/*attribute type*/AVP_CTRL_MSG_DOSBOX_MAC_ADDRESS);//FIXME: xl2tpd doesn't like this send as mandatory??
+		memcpy(w,ema.a,6);w+=6;
+		l2tp_avp_end(ab,w,wf);
+		writeptrupdate(w);
+		return *this;
+	}
+	bool avp_get_dosbox_mac_address(struct l2tp_ethernet_mac_addr_t &ema) {
+		struct avp_t *avp = recv_lookup_avp(AVP_CTRL_MSG_DOSBOX_MAC_ADDRESS,AVP_VENDOR_ID_DOSBOX);
+		if (avp && avp->length >= 6) {
+			unsigned char *r = avp->data,*rf = avp->data+avp->length;
+			memcpy(ema.a,r,6);r+=6;
+			assert(r <= rf);
+			return true;
+		}
+		return false;
+	}
+
+	L2TPpacket &avp_remote_session_id(const uint32_t ccid) {
+		needsmore(32);
+		unsigned char *w = writeptr(),*ab = w,*wf = writefence();
+		l2tp_avp_begin(w,wf,/*mandatory*/false,/*vendor*/0,/*attribute type*/AVP_CTRL_ASSN_REMOTE_SESSION_ID);//FIXME: xl2tpd doesn't like this send as mandatory??
+		*((uint32_t*)w) = htobe32(ccid);w+=4;
+		l2tp_avp_end(ab,w,wf);
+		writeptrupdate(w);
+		return *this;
+	}
+	uint32_t avp_remote_session_id(void) {
+		struct avp_t *avp = recv_lookup_avp(AVP_CTRL_ASSN_REMOTE_SESSION_ID);
+		if (avp && avp->length >= 4) {
+			unsigned char *r = avp->data,*rf = avp->data+avp->length;
+			uint32_t ccid = be32toh(*((uint32_t*)r)); r+=4;
+			assert(r <= rf);
+			return ccid;
+		}
+		return 0;
+	}
+
 	L2TPpacket &avp_assigned_control_connection_id(const uint32_t ccid) {
 		needsmore(32);
 		unsigned char *w = writeptr(),*ab = w,*wf = writefence();
@@ -420,7 +554,7 @@ struct L2TPpacket {
 		struct avp_t *avp = recv_lookup_avp(AVP_CTRL_ASSN_CTRL_CONN_ID);
 		if (avp && avp->length >= 4) {
 			unsigned char *r = avp->data,*rf = avp->data+avp->length;
-			uint32_t ccid = be32toh(*((uint16_t*)r)); r+=4;
+			uint32_t ccid = be32toh(*((uint32_t*)r)); r+=4;
 			assert(r <= rf);
 			return ccid;
 		}
@@ -465,6 +599,23 @@ struct L2TPpacket {
 			return ft;
 		}
 		return 0;
+	}
+
+	bool get_avp_pseudowire_capabilities_list(std::vector<uint16_t> &v) {
+		v.clear();
+		struct avp_t *avp = recv_lookup_avp(AVP_CTRL_PSW_CAP_LIST);
+		if (avp) {
+			const size_t sz = size_t(avp->length / 2u);
+			unsigned char *r = avp->data,*rf = avp->data+avp->length;
+
+			v.resize(sz);
+			uint16_t *d = v.data();
+			for (size_t i=0;i < sz;i++) { *d++ = be16toh(*((uint16_t*)r)); r+=2; }
+
+			assert(r <= rf);
+			return true;
+		}
+		return false;
 	}
 
 	L2TPpacket &avp_pseudowire_capabilities_list(const std::vector<uint16_t> &v) {
@@ -520,9 +671,10 @@ struct L2TPpacket {
 						a.length -= 6;
 						a.data = r;
 
-						if (a.vendor_id == 0) {
-							auto i=recv_avp_map.find(a.attribute_type);
-							if (i==recv_avp_map.end()) recv_avp_map[a.attribute_type] = recv_avp.size();
+						{
+							const uint32_t key = a.attribute_type | (a.vendor_id << 16u);
+							auto i=recv_avp_map.find(key);
+							if (i==recv_avp_map.end()) recv_avp_map[key] = recv_avp.size();
 						}
 
 						recv_avp.push_back(a);
@@ -530,6 +682,25 @@ struct L2TPpacket {
 					}
 
 					//if (r < rf) LOG_MSG("%u bytes left to parse",(unsigned int)(rf-r));
+				}
+				else if ((h&0x8000u) == 0) { /* data packet */
+					/* session header over UDP:
+					 *
+					 * <Txxxxxxxxxx ver> <reserved> T=0
+					 * <session ID>
+					 *
+					 * <optional L2-specific sublayer> (but we don't use this, so it's not there in OUR conversations)
+					 *
+					 * <payload>
+					 */
+					isdata = true;
+					use_session_id = 0;
+					length = udp.len;
+					r += 2;
+
+					if ((r+4) <= rf) {
+						use_session_id = be32toh(*((uint32_t*)r)); r+=4;
+					}
 				}
 
 				readptrupdate(r);
@@ -540,45 +711,364 @@ struct L2TPpacket {
 	}
 };
 
-static void ETHNET_ClientLoop(void) {
-	//TODO
-}
+static void DisconnectFromServer(bool unexpected);
 
-static void ETHNET_ServerLoop() {
+static std::vector<L2TPpacket> ethnet_client_recv;
+
+static void ETHNET_ClientLoop(void) {
+	uint32_t now = GetTicks();
 	UDPpacket inPacket,outPacket;
 	L2TPpacket pkt;
 	Bits result;
+
+	if (now >= l2tp_cli_timeout) {
+		LOG_MSG("ETHNET: Client timeout");
+		DisconnectFromServer(true);
+		return;
+	}
+	else if (now >= l2tp_cli_hello) {
+		l2tp_cli_hello = now + 2000 + ((int)rand() % 250);
+
+		pkt.clear().setseq(l2tp_ns,l2tp_nr).connection_id(l2tp_svr_control_connection_id).begin_control().avp_message_type(AVP_CTRL_MSG_TYPE_HELLO);
+		pkt.finishwrite().fillUDPpacket(/*&*/outPacket,UDPChannel);
+		result = SDLNet_UDP_Send(ethnetClientSocket, outPacket.channel, &outPacket);
+
+		LOG_MSG("ETHNET: Hello client to server");
+	}
+
+	pkt.clear().fillUDPpacketForRecv(/*&*/inPacket,4096);
+	result = SDLNet_UDP_Recv(ethnetClientSocket, &inPacket);
+	if (result) {
+		bool ignore = true;
+
+		pkt.didRecv(/*&*/inPacket);
+
+		LOG_MSG("Client in: ctrl=%u ver=%u length=%u Ns=%u Nr=%u conn=%u myConnection=%u theirConnection=%u messagetype=%u",
+			pkt.iscontrol,pkt.ver,pkt.length,pkt.Ns,pkt.Nr,pkt.connection_id(),
+			l2tp_cli_control_connection_id,l2tp_svr_control_connection_id,pkt.avp_message_type());
+
+		if (pkt.iscontrol) {
+			L2TPpacket resp;
+
+			if (pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_HELLO) {
+				if (l2tp_cli_control_connection_id == pkt.connection_id()) {
+					if (now < l2tp_cli_hello_accept) ignore = true;/*avoid HELLO storms*/
+					l2tp_cli_hello_accept = GetTicks() + 500;
+					ignore = false;
+				}
+			}
+			else if (pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_ACK) {
+				ignore = true;
+			}
+			else {
+				if (l2tp_cli_control_connection_id == pkt.connection_id()) {
+					ignore = false;
+				}
+			}
+
+			if (resp.write == 0 && !ignore) { /* ACK */
+				pkt.clear()
+					.setseq(/*Ns=*/pkt.Nr,/*Nr=*/pkt.Ns+1u)
+					.connection_id(l2tp_svr_control_connection_id)
+					.begin_control()
+					.avp_message_type(AVP_CTRL_MSG_TYPE_ACK)
+					.finishwrite()
+					.fillUDPpacket(/*&*/outPacket,UDPChannel);
+				result = SDLNet_UDP_Send(ethnetClientSocket, outPacket.channel, &outPacket);
+			}
+		}
+		else if (pkt.isdata) {
+			if (l2tp_cli_session_id && pkt.session_id() == l2tp_cli_session_id) {
+				size_t sz = pkt.canread();
+				if (sz >= 14) {
+					unsigned char *r = pkt.readptr(),*rf = pkt.readfence();
+
+					/* bytes 0-5: destination Ethernet MAC
+					 * bytes 6-11: source Ethernet MAC
+					 * bytes 12-13: EtherType (or length if less than 1536) */
+					LOG_MSG("Client: Incoming data packet ofs=%u len=%u dest=%02X:%02X:%02X:%02X:%02X:%02X src=%02X:%02X:%02X:%02X:%02X:%02X type=0x%04x",
+						(unsigned int)pkt.read,
+						(unsigned int)(rf-r),
+						r[0],r[1],r[2],r[3],r[4],r[5],
+						r[6],r[7],r[8],r[9],r[10],r[11],
+						be16toh(*((uint16_t*)(r+12))));
+
+					if (ethnet_client_recv.size() < 256) {
+						ethnet_client_recv.push_back(std::move(pkt));
+						pkt.clear();
+					}
+					else {
+						LOG_MSG("Client: Receive buffer overrun");
+					}
+				}
+			}
+		}
+
+		l2tp_cli_timeout = GetTicks() + 15000;
+		l2tp_cli_hello = GetTicks() + 3000;
+	}
+}
+
+bool NE2K_IsInit(void);
+bool NE2K_GetMacAddress(unsigned char *buf);
+
+static void ETHNET_ServerLoop() {
+	uint32_t now = GetTicks();
+	UDPpacket inPacket,outPacket;
+	L2TPpacket pkt;
+	Bits result;
+
+	if (now >= ethnetServerTimeoutCheck) {
+		for (unsigned int ci=0;ci < SOCKETTABLESIZE;ci++) {
+			struct l2tp_client_t *c = &l2tp_client[ci];
+			if (c->active) {
+				if (now >= c->timeout) {
+					LOG_MSG("ETHNET: Server client timeout");
+					c->active = false;
+				}
+				else if (now >= c->hello) {
+					c->hello = now + 3000.0 + ((int)rand() % 250);
+
+					// FIXME: Needs to use Ns = Last Nr from client
+					pkt.clear()
+						.setseq(/*Ns=*/0,/*Nr=*/0)
+						.connection_id(c->their_control_connection_id)
+						.begin_control()
+						.avp_message_type(AVP_CTRL_MSG_TYPE_HELLO)
+						.finishwrite()
+						.fillUDPpacket(/*&*/outPacket,UDPChannel);
+					outPacket.address = c->clientIP;
+					result = SDLNet_UDP_Send(ethnetServerSocket, -1, &outPacket);
+
+					LOG_MSG("ETHNET: Hello server to client");
+				}
+			}
+		}
+		ethnetServerTimeoutCheck = now + 100.0;
+	}
 
 	pkt.clear().fillUDPpacketForRecv(/*&*/inPacket,4096);
 	result = SDLNet_UDP_Recv(ethnetServerSocket, &inPacket);
 	if (result) {
 		pkt.didRecv(/*&*/inPacket);
 
-		LOG_MSG("Server in: ctrl=%u ver=%u length=%u Ns=%u Nr=%u conn=%u",
-			pkt.iscontrol,pkt.ver,pkt.length,pkt.Ns,pkt.Nr,pkt.connection_id());
+		struct l2tp_client_t *c = lookup_client_by_ip(inPacket.address);
+		bool disconnect = false;
+		bool ignore = true;
+
+		LOG_MSG("Server in: ctrl=%u data=%u ver=%u length=%u Ns=%u Nr=%u conn=%u knownConnection=%u myConnection=%u theirConnection=%u messagetype=%u session_id=%u mysession=%u theirsession=%u ofs=%u",
+			pkt.iscontrol,pkt.isdata,pkt.ver,pkt.length,pkt.Ns,pkt.Nr,pkt.connection_id(),c?1:0,
+			c?c->my_control_connection_id:0,c?c->their_control_connection_id:0,pkt.avp_message_type(),
+			pkt.session_id(),c?c->my_session_id:0,c?c->their_session_id:0,(unsigned int)pkt.read);
 
 		if (pkt.iscontrol) {
 			L2TPpacket resp;
 
-			if (pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_SCCRP) {
+			if (pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_SCCRQ) {
 				uint32_t sfc = pkt.avp_framing_caps();
 				uint32_t accid = pkt.avp_assigned_control_connection_id();
-				if ((sfc&3) && pkt.connection_id() == 0 && accid != 0) {
-					struct l2tp_client_t *c = lookup_client_by_ip(inPacket.address);
-					if (c == NULL) c = new_client_by_ip(inPacket.address);
-					if (c) {
-						pkt.clear().connection_id(0).begin_control().finishwrite().fillUDPpacket(/*&*/outPacket,UDPChannel);
-						outPacket.address = inPacket.address;
-						result = SDLNet_UDP_Send(ethnetServerSocket, -1, &outPacket);
+				std::vector<uint16_t> got_pscl;
+				bool can_ethernet = false;
+
+				pkt.get_avp_pseudowire_capabilities_list(got_pscl);
+				for (const auto &pw : got_pscl) {
+					if (pw == 0x0005/*ethernet*/)
+						can_ethernet = true;
+				}
+
+				/* create new connection only for SCCRQ */
+				if (c == NULL) c = new_client_by_ip(inPacket.address);
+
+				ignore = false;
+				if ((sfc&3) && pkt.connection_id() == 0 && accid != 0 && c && can_ethernet) {
+					std::vector<uint16_t> pscl = {0x0005/*ethernet*/};
+					bool has_my_mac = false;
+					bool has_their_mac = pkt.avp_get_dosbox_mac_address(c->their_mac_address);
+
+					if (NE2K_IsInit()) {
+						if (NE2K_GetMacAddress(c->my_mac_address.a)) {
+							has_my_mac = true;
+						}
 					}
+
+					c->their_control_connection_id = accid;
+					if (c->my_control_connection_id == 0) c->my_control_connection_id = (uint32_t)rand()*rand();
+					pkt.clear()
+						.setseq(/*Ns=*/pkt.Nr,/*Nr=*/pkt.Ns+1u)
+						.connection_id(c->their_control_connection_id)
+						.begin_control()
+						.avp_message_type(AVP_CTRL_MSG_TYPE_SCCRP)
+						.avp_assigned_control_connection_id(c->my_control_connection_id)
+						.avp_vendor_name("DOSBox-X")
+						.avp_pseudowire_capabilities_list(pscl)
+						.avp_framing_caps(3);/*A=1 S=1*/
+					if (has_my_mac)
+						pkt.avp_dosbox_mac_address(c->my_mac_address);
+					pkt.finishwrite()
+						.fillUDPpacket(/*&*/outPacket,UDPChannel);
+					outPacket.address = inPacket.address;
+					result = SDLNet_UDP_Send(ethnetServerSocket, -1, &outPacket);
+
+					LOG_MSG("Server: SCCRQ hasmymac=%u hastheirmac=%u my_mac=%02X:%02X:%02X:%02X:%02X:%02X their_mac=%02X:%02X:%02X:%02X:%02X:%02X",
+						has_my_mac,
+						has_their_mac,
+						c->my_mac_address.a[0],
+						c->my_mac_address.a[1],
+						c->my_mac_address.a[2],
+						c->my_mac_address.a[3],
+						c->my_mac_address.a[4],
+						c->my_mac_address.a[5],
+						c->their_mac_address.a[0],
+						c->their_mac_address.a[1],
+						c->their_mac_address.a[2],
+						c->their_mac_address.a[3],
+						c->their_mac_address.a[4],
+						c->their_mac_address.a[5]);
+				}
+			}
+			else if (pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_ICRQ) {
+				uint32_t myid = pkt.avp_remote_session_id();
+				uint32_t theirid = pkt.avp_local_session_id();
+				std::vector<uint16_t> got_pscl;
+				bool can_ethernet = false;
+
+				pkt.get_avp_pseudowire_capabilities_list(got_pscl);
+				for (const auto &pw : got_pscl) {
+					if (pw == 0x0005/*ethernet*/)
+						can_ethernet = true;
+				}
+
+				ignore = false;
+				if (c && c->my_control_connection_id == pkt.connection_id() && can_ethernet && myid && theirid) {
+					std::vector<uint16_t> pscl = {0x0005/*ethernet*/};
+
+					c->my_session_id = myid;
+					c->their_session_id = theirid;
+
+					pkt.clear()
+						.setseq(/*Ns=*/pkt.Nr,/*Nr=*/pkt.Ns+1u)
+						.connection_id(c->their_control_connection_id)
+						.begin_control()
+						.avp_message_type(AVP_CTRL_MSG_TYPE_ICRP)
+						.avp_local_session_id(c->my_session_id)
+						.avp_remote_session_id(c->their_session_id)
+						.avp_vendor_name("DOSBox-X")
+						.avp_pseudowire_capabilities_list(pscl)
+						.finishwrite()
+						.fillUDPpacket(/*&*/outPacket,UDPChannel);
+					outPacket.address = inPacket.address;
+					result = SDLNet_UDP_Send(ethnetServerSocket, -1, &outPacket);
+				}
+			}
+			else if (pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_ICCN) {
+				if (c && c->my_control_connection_id == pkt.connection_id()) {
+					c->ethpkt_ok = true;
+				}
+			}
+			else if (pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_HELLO) {
+				if (c && c->my_control_connection_id == pkt.connection_id()) {
+					if (now < c->hello_accept) ignore = true;/*avoid HELLO storms*/
+					c->hello_accept = GetTicks() + 500;
+					ignore = false;
+				}
+			}
+			else if (pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_StopCCN) {
+				if (c && c->my_control_connection_id == pkt.connection_id()) {
+					/* client wishes to tear down control connection and sessions */
+					LOG_MSG("Server: Client wants to disconnect");
+					disconnect = true;
+					ignore = false;
+				}
+			}
+			else if (pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_ACK) {
+				ignore = true;
+			}
+			else {
+				if (c && c->my_control_connection_id == pkt.connection_id()) {
+					ignore = false;
 				}
 			}
 
-			if (resp.write == 0) { /* error packet apparently is just 12 bytes long, no AVPs */
-				pkt.clear().connection_id(0).begin_control().finishwrite().fillUDPpacket(/*&*/outPacket,UDPChannel);
+			if (resp.write == 0 && !ignore) { /* ACK, no AVPs */
+				pkt.clear()
+					.setseq(/*Ns=*/pkt.Nr,/*Nr=*/pkt.Ns+1u)
+					.connection_id(c?c->their_control_connection_id:0)
+					.begin_control()
+					.avp_message_type(AVP_CTRL_MSG_TYPE_ACK)
+					.finishwrite()
+					.fillUDPpacket(/*&*/outPacket,UDPChannel);
 				outPacket.address = inPacket.address;
 				result = SDLNet_UDP_Send(ethnetServerSocket, -1, &outPacket);
 			}
+
+			if (disconnect) {
+				c->ethpkt_ok = false;
+				c->active = false;
+			}
+		}
+		else if (pkt.isdata) {
+			if (c && c->my_session_id && pkt.session_id() == c->my_session_id) {
+				size_t sz = pkt.canread();
+				if (sz >= 14) {
+					unsigned char *r = pkt.readptr(),*rf = pkt.readfence();
+
+					/* bytes 0-5: destination Ethernet MAC
+					 * bytes 6-11: source Ethernet MAC
+					 * bytes 12-13: EtherType (or length if less than 1536) */
+					LOG_MSG("Server: Incoming data packet ofs=%u len=%u dest=%02X:%02X:%02X:%02X:%02X:%02X src=%02X:%02X:%02X:%02X:%02X:%02X type=0x%04x",
+						(unsigned int)pkt.read,
+						(unsigned int)(rf-r),
+						r[0],r[1],r[2],r[3],r[4],r[5],
+						r[6],r[7],r[8],r[9],r[10],r[11],
+						be16toh(*((uint16_t*)(r+12))));
+
+					/* [https://en.wikipedia.org/wiki/Multicast_address#Ethernet] */
+					/* "Ethernet frames with a value of 1 in the least-significant bit of the first octet[c]
+					 * of the destination MAC address are treated as multicast frames and are flooded to all
+					 * points on the network. While frames with ones in all bits of the destination address
+					 * (FF-FF-FF-FF-FF-FF) are sometimes referred to as broadcasts, Ethernet generally does
+					 * not distinguish between multicast and broadcast frames." */
+					bool dst_is_broadcast = !!(r[0]&1);
+
+					if (dst_is_broadcast) {
+						for (unsigned int ci=0;ci < SOCKETTABLESIZE;ci++) {
+							struct l2tp_client_t &c = l2tp_client[ci];
+							if (c.active && c.ethpkt_ok) {
+								/* don't send it back! */
+								if (!memcmp(c.their_mac_address.a,r+6,6)) continue;
+
+								pkt.write = pkt.length;
+								pkt.session_id(c.their_session_id).rewrite_session_id().fillUDPpacket(/*&*/outPacket,UDPChannel);
+								outPacket.address = c.clientIP;
+								result = SDLNet_UDP_Send(ethnetServerSocket, -1, &outPacket);
+								LOG_MSG("Server: Relaying packet to connection=%u theirconnection=%u",
+									ci,c.their_control_connection_id);
+							}
+						}
+					}
+					else {
+						for (unsigned int ci=0;ci < SOCKETTABLESIZE;ci++) {
+							struct l2tp_client_t &c = l2tp_client[ci];
+							if (c.active && c.ethpkt_ok) {
+								if (!memcmp(c.their_mac_address.a,r,6)) {
+									pkt.write = pkt.length;
+									pkt.session_id(c.their_session_id).rewrite_session_id().fillUDPpacket(/*&*/outPacket,UDPChannel);
+									outPacket.address = c.clientIP;
+									result = SDLNet_UDP_Send(ethnetServerSocket, -1, &outPacket);
+									LOG_MSG("Server: Relaying packet to connection=%u theirconnection=%u",
+										ci,c.their_control_connection_id);
+									break;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if (c) {
+			c->timeout = GetTicks() + 15000;
+			c->hello = GetTicks() + 4000;
 		}
 	}
 }
@@ -589,10 +1079,14 @@ void ETHNET_StopServer() {
 }
 
 bool ETHNET_StartServer(uint16_t portnum) {
+	uint16_t i;
+
 	if(!SDLNet_ResolveHost(&ethnetServerIp, NULL, portnum)) {
 		//serverSocketSet = SDLNet_AllocSocketSet(SOCKETTABLESIZE);
 		ethnetServerSocket = SDLNet_UDP_Open(portnum);
 		if(!ethnetServerSocket) return false;
+
+		for(i=0;i<SOCKETTABLESIZE;i++) l2tp_client[i].active = false;
 
 		TIMER_AddTickHandler(&ETHNET_ServerLoop);
 		return true;
@@ -618,14 +1112,28 @@ static bool ConnectToServer(char const *strAddr) {
 			l2tp_nr = 0;
 			l2tp_cli_control_connection_id = (uint32_t)(rand()*rand());
 			l2tp_svr_control_connection_id = 0;
+			l2tp_cli_mac_addr = l2tp_ethernet_mac_addr_t();
+			l2tp_svr_mac_addr = l2tp_ethernet_mac_addr_t();
+			l2tp_cli_session_id = 0;
+			l2tp_svr_session_id = 0;
 			l2tp_cli_router_id = (uint32_t)(rand()*rand());
 			l2tp_svr_router_id = 0;
+			l2tp_cli_hello = 0;
+			l2tp_cli_timeout = 0;
+			l2tp_ethpkt_ok = false;
+
+			bool has_mac = false;
+			if (NE2K_IsInit()) {
+				if (NE2K_GetMacAddress(l2tp_cli_mac_addr.a)) {
+					has_mac = true;
+				}
+			}
 
 			/* SCCRQ [https://www.rfc-editor.org/info/rfc3931/#section-6.1] */
 			/* [https://www.rfc-editor.org/info/rfc3931/#section-5.4.1] */
 			/* [https://www.rfc-editor.org/info/rfc3931/#section-3.1] */
 			/* [https://www.rfc-editor.org/info/rfc2661/] Assigned Tunnel ID because xl2tpd doesn't know the control connection ID tag */
-			pkt.clear().connection_id(0).begin_control()
+			pkt.clear().connection_id(0).setseq(l2tp_ns,l2tp_nr).begin_control()
 				.avp_message_type(AVP_CTRL_MSG_TYPE_SCCRQ)
 				.avp_assigned_control_connection_id(l2tp_cli_control_connection_id)
 				.avp_framing_caps(3)/*A=1 S=1*/
@@ -640,9 +1148,17 @@ static bool ConnectToServer(char const *strAddr) {
 				snprintf(tmp,sizeof(tmp),"DOSBox-X.%u,%u",(unsigned int)r1,(unsigned int)r2);
 				pkt.avp_host_name(tmp);
 			}
+			if (has_mac) pkt.avp_dosbox_mac_address(l2tp_cli_mac_addr);
 			pkt.finishwrite().fillUDPpacket(/*&*/regPacket,UDPChannel);
-			LOG_MSG("ETHNET: Starting L2TP with assigned ctrlconnid=%u",
-				l2tp_cli_control_connection_id);
+			LOG_MSG("ETHNET: Starting L2TP with assigned ctrlconnid=%u hasmac=%u MAC=%02X:%02X:%02X:%02X:%02X:%02X",
+				l2tp_cli_control_connection_id,
+				has_mac,
+				l2tp_cli_mac_addr.a[0],
+				l2tp_cli_mac_addr.a[1],
+				l2tp_cli_mac_addr.a[2],
+				l2tp_cli_mac_addr.a[3],
+				l2tp_cli_mac_addr.a[4],
+				l2tp_cli_mac_addr.a[5]);
 			l2tp_ns++;
 			numsent = SDLNet_UDP_Send(ethnetClientSocket, regPacket.channel, &regPacket);
 			if(!numsent) {
@@ -668,31 +1184,50 @@ static bool ConnectToServer(char const *strAddr) {
 					if (result != 0) {
 						bool ok = false;
 
+						/* Ns should match the Nr we sent */
+
 						pkt.didRecv(/*&*/regPacket);
-						LOG_MSG("In: ctrl=%u ver=%u length=%u Ns=%u Nr=%u conn=%u",
-							pkt.iscontrol,pkt.ver,pkt.length,pkt.Ns,pkt.Nr,pkt.connection_id());
+						LOG_MSG("In: ctrl=%u ver=%u length=%u Ns=%u Nr=%u conn=%u NsExpect=%u",
+							pkt.iscontrol,pkt.ver,pkt.length,pkt.Ns,pkt.Nr,pkt.connection_id(),l2tp_nr);
 
-						if (pkt.iscontrol && pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_SCCRP) {
+						if (pkt.iscontrol && pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_ACK) {
+						}
+						else if (pkt.iscontrol && pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_SCCRP) {
 							uint32_t sfc = pkt.avp_framing_caps();
-							LOG_MSG("framing_caps: svr(just recv)=%u",sfc);
-							ok = true;
-						}
+							uint32_t accid = pkt.avp_assigned_control_connection_id();
+							std::vector<uint16_t> got_pscl;
+							bool can_ethernet = false;
 
-						if (ok) {
-							l2tp_nr++;
-							break;
-						}
-						else {
-							LOG_MSG("Failed to connect to server %s", strAddr);
-							SDLNet_UDP_Close(ethnetClientSocket);
-							return false;
+							pkt.get_avp_pseudowire_capabilities_list(got_pscl);
+							for (const auto &pw : got_pscl) {
+								if (pw == 0x0005/*ethernet*/)
+									can_ethernet = true;
+							}
+
+							LOG_MSG("framing_caps: svr(just recv)=%u",sfc);
+							LOG_MSG("assigned_control_connection_id: svr(just recv)=%u",accid);
+							LOG_MSG("pseudowire can ethernet: %u",can_ethernet);
+							if (sfc && accid && can_ethernet) {
+								l2tp_svr_control_connection_id = accid;
+								ok = true;
+							}
+
+							if (ok) {
+								l2tp_nr++;
+								break;
+							}
+							else {
+								LOG_MSG("Failed to connect to server %s", strAddr);
+								SDLNet_UDP_Close(ethnetClientSocket);
+								return false;
+							}
 						}
 					}
 				}
 			}
 
 			/* SCCCN [https://www.rfc-editor.org/info/rfc3931/#section-6.3] */
-			pkt.clear().connection_id(l2tp_svr_control_connection_id).begin_control()
+			pkt.clear().setseq(l2tp_ns,l2tp_nr).connection_id(l2tp_svr_control_connection_id).setseq(l2tp_ns,l2tp_nr).begin_control()
 				.avp_message_type(AVP_CTRL_MSG_TYPE_SCCCN);
 			pkt.finishwrite().fillUDPpacket(/*&*/regPacket,UDPChannel);
 			LOG_MSG("ETHNET: Completing L2TP with assigned ctrlconnid=%u",
@@ -705,8 +1240,107 @@ static bool ConnectToServer(char const *strAddr) {
 				return false;
 			}
 
+			/* ICRQ [https://www.rfc-editor.org/info/rfc3931/#section-6.6] */
+			l2tp_cli_session_id = (uint32_t)rand()*rand();
+			l2tp_svr_session_id = (uint32_t)rand()*rand();
+			pkt.clear().setseq(l2tp_ns,l2tp_nr).connection_id(l2tp_svr_control_connection_id).setseq(l2tp_ns,l2tp_nr).begin_control()
+				.avp_message_type(AVP_CTRL_MSG_TYPE_ICRQ)
+				.avp_local_session_id(l2tp_cli_session_id)
+				.avp_remote_session_id(l2tp_svr_session_id)
+				.avp_pseudowire_capabilities_list(pscl)
+				.avp_vendor_name("DOSBox-X");
+			pkt.finishwrite().fillUDPpacket(/*&*/regPacket,UDPChannel);
+			LOG_MSG("ETHNET: Starting L2TP call with assigned ctrlconnid=%u local_session=%u remote_session=%u",
+				l2tp_cli_control_connection_id,l2tp_cli_session_id,l2tp_svr_session_id);
+			l2tp_ns++;
+			numsent = SDLNet_UDP_Send(ethnetClientSocket, regPacket.channel, &regPacket);
+			if(!numsent) {
+				LOG_MSG("ETHNET: Unable to connect to server: %s", SDLNet_GetError());
+				SDLNet_UDP_Close(ethnetClientSocket);
+				return false;
+			}
+
+			/* ICRP [https://www.rfc-editor.org/info/rfc3931/#section-6.7] */
+			{
+				Bits result;
+
+				while(true) {
+					uint32_t elapsed = GetTicks() - ticks;
+					if(elapsed > 5000) {
+						LOG_MSG("Timeout connecting to server at %s", strAddr);
+						SDLNet_UDP_Close(ethnetClientSocket);
+						return false;
+					}
+					CALLBACK_Idle();
+					pkt.clear().fillUDPpacketForRecv(/*&*/regPacket,4096);
+					result = SDLNet_UDP_Recv(ethnetClientSocket, &regPacket);
+					if (result != 0) {
+						bool ok = false;
+
+						/* Ns should match the Nr we sent */
+
+						pkt.didRecv(/*&*/regPacket);
+						LOG_MSG("In: ctrl=%u ver=%u length=%u Ns=%u Nr=%u conn=%u NsExpect=%u mt=%u",
+							pkt.iscontrol,pkt.ver,pkt.length,pkt.Ns,pkt.Nr,pkt.connection_id(),l2tp_nr,pkt.avp_message_type());
+
+						if (pkt.iscontrol && pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_ACK) {
+						}
+						else if (pkt.iscontrol && pkt.avp_message_type() == AVP_CTRL_MSG_TYPE_ICRP) {
+							uint32_t theirid = pkt.avp_local_session_id();
+							uint32_t myid = pkt.avp_remote_session_id();
+							std::vector<uint16_t> got_pscl;
+							bool can_ethernet = false;
+
+							pkt.get_avp_pseudowire_capabilities_list(got_pscl);
+							for (const auto &pw : got_pscl) {
+								if (pw == 0x0005/*ethernet*/)
+									can_ethernet = true;
+							}
+
+							LOG_MSG("remote (client) session id: svr(just recv)=%u",myid);
+							LOG_MSG("local (server) session id: svr(just recv)=%u",theirid);
+							LOG_MSG("pseudowire can ethernet: %u",can_ethernet);
+							if (myid && theirid && can_ethernet) {
+								if (myid == l2tp_cli_session_id && theirid == l2tp_svr_session_id) ok = true;
+							}
+
+							if (ok) {
+								l2tp_nr++;
+								break;
+							}
+							else {
+								LOG_MSG("Failed to connect to server %s", strAddr);
+								SDLNet_UDP_Close(ethnetClientSocket);
+								return false;
+							}
+						}
+					}
+				}
+			}
+
+			/* ICCN [https://www.rfc-editor.org/info/rfc3931/#section-6.8] */
+			pkt.clear().setseq(l2tp_ns,l2tp_nr).connection_id(l2tp_svr_control_connection_id).setseq(l2tp_ns,l2tp_nr).begin_control()
+				.avp_message_type(AVP_CTRL_MSG_TYPE_ICCN)
+				.avp_local_session_id(l2tp_cli_session_id)
+				.avp_remote_session_id(l2tp_svr_session_id);
+			pkt.finishwrite().fillUDPpacket(/*&*/regPacket,UDPChannel);
+			LOG_MSG("ETHNET: Completing L2TP call with assigned ctrlconnid=%u",
+				l2tp_cli_control_connection_id);
+			l2tp_ns++;
+			numsent = SDLNet_UDP_Send(ethnetClientSocket, regPacket.channel, &regPacket);
+			if(!numsent) {
+				LOG_MSG("ETHNET: Unable to connect to server: %s", SDLNet_GetError());
+				SDLNet_UDP_Close(ethnetClientSocket);
+				return false;
+			}
+
 			LOG_MSG("ETHNET: Connected to server.");
 
+			l2tp_cli_hello = GetTicks() + 3000;
+			l2tp_cli_timeout = GetTicks() + 15000;
+
+			l2tp_ethpkt_ok = true;
+			ethnet_client_recv.clear();
 			incomingPacket.connected = true;
 			TIMER_AddTickHandler(&ETHNET_ClientLoop);
 			return true;
@@ -719,12 +1353,70 @@ static bool ConnectToServer(char const *strAddr) {
 	return false;
 }
 
+static void ClientStopCCN(void) {
+	if (incomingPacket.connected) {
+		UDPpacket regPacket={0};
+		L2TPpacket pkt;
+		pkt.clear().setseq(l2tp_ns,l2tp_nr).connection_id(l2tp_svr_control_connection_id).setseq(l2tp_ns,l2tp_nr).begin_control()
+			.avp_message_type(AVP_CTRL_MSG_TYPE_StopCCN);
+		pkt.finishwrite().fillUDPpacket(/*&*/regPacket,UDPChannel);
+		LOG_MSG("ETHNET: Client sending StopCCN to server");
+		l2tp_ns++;
+		SDLNet_UDP_Send(ethnetClientSocket, regPacket.channel, &regPacket);
+	}
+}
+
 static void DisconnectFromServer(bool unexpected) {
+	l2tp_ethpkt_ok = false;
+	ethnet_client_recv.clear();
 	if(unexpected) LOG_MSG("ETHNET: Server disconnected unexpectedly");
 	if(incomingPacket.connected) {
+		if (!unexpected) ClientStopCCN(); // Let the server know!
 		incomingPacket.connected = false;
 		TIMER_DelTickHandler(&ETHNET_ClientLoop);
 		SDLNet_UDP_Close(ethnetClientSocket);
+	}
+}
+
+void EthnetEthernetConnection::GetPackets(std::function<void(const uint8_t*, int)> callback)
+{
+	std::vector<L2TPpacket> recv = std::move(ethnet_client_recv);
+	ethnet_client_recv.clear();
+
+	for (auto &pkt : recv) {
+		unsigned char *r = pkt.readptr(),*rf = pkt.readfence();
+		if (r < rf) callback((const uint8_t*)r,(int)(rf-r));
+	}
+
+	ethnet_client_recv.clear();
+}
+
+void EthnetEthernetConnection::SendPacket(const uint8_t* packet, int len)
+{
+	if (l2tp_ethpkt_ok && len >= 14) {
+		/* encapsulate into a data packet and send to server.
+		 * packet data includes ethernet header */
+		/* bytes 0-5: destination Ethernet MAC
+		 * bytes 6-11: source Ethernet MAC
+		 * bytes 12-13: EtherType (or length if less than 1536) */
+		UDPpacket outPacket;
+		L2TPpacket pkt;
+		Bits result;
+
+		pkt.clear()
+			.session_id(l2tp_svr_session_id)
+			.begin_data()
+			.needs(len+64);
+		{
+			unsigned char *w = pkt.writeptr(),*wf = pkt.writefence();
+			memcpy(w,packet,len); w+=len;
+			pkt.writeptrupdate(w);
+		}
+		pkt.finishwrite().fillUDPpacket(/*&*/outPacket,UDPChannel);
+		result = SDLNet_UDP_Send(ethnetClientSocket, outPacket.channel, &outPacket);
+		if (!result) DisconnectFromServer(true);
+
+		LOG_MSG("SendPacket ethlen=%u pktlen=%u",(unsigned int)len,(unsigned int)pkt.write);
 	}
 }
 
