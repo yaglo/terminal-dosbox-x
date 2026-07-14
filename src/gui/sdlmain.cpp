@@ -2243,6 +2243,19 @@ Bitu GFX_SetSize(Bitu width, Bitu height, Bitu flags, double scalex, double scal
     sdl.draw.scalex = scalex;
     sdl.draw.scaley = scaley;
 
+    /* Publish the mode's corrected DISPLAY aspect (width*scalex : height*scaley)
+       so the "terminal" SDL video driver can letterbox correctly. It can't tell a
+       non-square DOS/text mode (320x200 -> 4:3) from a square hi-res one (Windows
+       1280x800 -> 16:10) from pixels alone; scalex/scaley carry DOSBox's real
+       per-mode pixel-aspect, so this flips automatically as the guest changes
+       modes. The driver reads it via SDL_GetHint each frame; harmless elsewhere. */
+    if (height > 0 && scaley > 0.0) {
+        char arbuf[32];
+        snprintf(arbuf, sizeof(arbuf), "%.6f",
+                 ((double)width * scalex) / ((double)height * scaley));
+        SDL_SetHint("DOSBOX_DISPLAY_ASPECT", arbuf);
+    }
+
     LOG(LOG_MISC,LOG_DEBUG)("GFX_SetSize %ux%u flags=0x%x scale=%.3fx%.3f",
         (unsigned int)width,(unsigned int)height,
         (unsigned int)flags,
