@@ -6,6 +6,10 @@ terminal** — no window, no X11, no Wayland — by streaming each frame over th
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
 It works in [Ubiquitty](https://github.com/yaglo/ubiquitty), kitty, and Ghostty.
 
+![Dune II running under DOSBox-X in the top half of a terminal, with Neovim below](docs/dune2-terminal.png)
+
+*Dune II (DOSBox-X) rendering in a terminal at 4:3, sharing the window with Neovim.*
+
 ```sh
 dos ~/games/            # mount a folder as C: and drop to the DOS prompt, in your terminal
 ```
