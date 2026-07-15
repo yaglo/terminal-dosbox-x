@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# build-terminal.sh — fast rebuild after editing the SDL2 "terminal" video driver
-# (vs/sdl2/src/video/dummy/SDL_terminalvideo.c).
+# build-terminal.sh — fast rebuild after editing the SDL2 "terminal" video driver.
+#
+# The driver source is single-sourced from the sdl-terminal-video repo, pulled in
+# as a git submodule at vs/sdl-terminal-video; vs/sdl2/src/video/dummy/
+# SDL_terminalvideo.c is a SYMLINK into it. Edit the driver THERE (or in the
+# submodule checkout) — not through a second copy. This script makes sure the
+# submodule is checked out before building.
 #
 # Does NOT touch configure/config.h or rebuild the other vendored libraries
 # (zlib/libpng/freetype) — it only recompiles the driver object, refreshes the
@@ -23,6 +28,18 @@ fail() { echo "build-terminal.sh: $*" >&2; exit 1; }
 note() { echo "==> $*"; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# The driver lives in the sdl-terminal-video submodule; the vs/sdl2 path is a
+# symlink into it. Make sure it's checked out so the symlink resolves before the
+# SDL build globs it. (No-op outside a git checkout, e.g. a source tarball where
+# the driver was already materialized.)
+if [ -f .gitmodules ] && have_cmd git && git rev-parse --git-dir >/dev/null 2>&1; then
+    if [ ! -e vs/sdl-terminal-video/src/SDL_terminalvideo.c ]; then
+        note "checking out sdl-terminal-video submodule (driver source)"
+        git submodule update --init vs/sdl-terminal-video \
+            || fail "git submodule update failed — run: git submodule update --init vs/sdl-terminal-video"
+    fi
+fi
 
 # Portable replacement for GNU coreutils `timeout` (absent on stock macOS).
 run_with_timeout() {
