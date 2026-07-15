@@ -1,4 +1,36 @@
 
+# DOSBox-X that runs in your terminal
+
+This is a fork of **DOSBox-X** that renders and runs **entirely inside a
+terminal** — no window, no X11, no Wayland — by streaming each frame over the
+[Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
+It works in [Ubiquitty](https://github.com/yaglo/ubiquitty), kitty, and Ghostty.
+
+```sh
+dos ~/games/            # mount a folder as C: and drop to the DOS prompt, in your terminal
+```
+
+The mechanism is a general-purpose SDL2 **`terminal` video driver**, so the same
+trick works for any pure-SDL2 program (ioquake3, etc.), not just DOSBox-X. The
+driver lives in its own repo, [sdl-terminal-video](https://github.com/yaglo/sdl-terminal-video),
+and is pulled in here as a git submodule.
+
+- **How to run it:** [TERMINAL.md](TERMINAL.md)
+- **Architecture & milestones:** [TERMINAL_PORT_PLAN.md](TERMINAL_PORT_PLAN.md)
+
+> **Clone with submodules** so the driver source is present:
+> ```sh
+> git clone --recursive https://github.com/yaglo/terminal-dosbox-x
+> # already cloned without --recursive?
+> git submodule update --init vs/sdl-terminal-video
+> ```
+> The build scripts (`build-terminal.sh`, `build-macos-sdl2`) also check it out
+> automatically.
+
+---
+
+*Upstream DOSBox-X README follows.*
+
 **Welcome to the DOSBox-X project homepage located on GitHub.**
 
 ## Useful links

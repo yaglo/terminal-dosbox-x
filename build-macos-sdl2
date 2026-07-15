@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
 
+# The 'terminal' SDL video driver is single-sourced from the sdl-terminal-video
+# submodule: vs/sdl2/src/video/dummy/SDL_terminalvideo.c is a symlink into it.
+# Check it out so the symlink resolves before SDL is built (a plain, non-recursive
+# clone otherwise leaves it dangling). No-op outside a git checkout.
+if [ -f .gitmodules ] && command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+    if [ ! -e vs/sdl-terminal-video/src/SDL_terminalvideo.c ]; then
+        echo "==> checking out sdl-terminal-video submodule (driver source)"
+        git submodule update --init vs/sdl-terminal-video || exit 1
+    fi
+fi
+
 # I'm sick and tired of all the churn the three versions of autoconf
 # are causing in this repo. Stop committing the configure scripts
 # and just autoregen.
