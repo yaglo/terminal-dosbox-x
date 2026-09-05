@@ -84,14 +84,14 @@ resolution** (no resampling) and drops its own cell box; all scaling is the
 terminal's.
 
 To correct DOS's non-square pixels (320×200 is drawn for 4:3, not its raw 8:5),
-the driver declares the intended display aspect to the terminal via **OSC 2501**
+the driver declares the intended display aspect to the terminal via **OSC 7402**
 (`fit=stretch;ar=W:H`), taken from DOSBox's per-mode aspect — so text and graphics
 modes each display at the right shape and flip automatically as the guest changes
-modes. Note that **OSC 2501 is not DECSET 7402** — an OSC is a different
-namespace from a private mode number, so it collides with nothing and kept its
-number when the modes moved into the 7400 block. On a terminal that implements
-7402 but lacks the display-aspect knob, the `ar` is ignored and the frame shows
-at its native pixel ratio instead. The driver emits `?7402h` on start (when
+modes. One feature, one number: the OSC that configures the mode answers on the
+same number as the DECSET that turns it on. (It was OSC 2501 while the private
+modes lived at 25xx; terminals accept that older spelling for one release.) On a
+terminal that implements 7402 but lacks the display-aspect knob, the `ar` is
+ignored and the frame shows at its native pixel ratio instead. The driver emits `?7402h` on start (when
 enabled) and `?7402l` on exit.
 
 For **square-pixel guests like Windows**, stretch-to-fill isn't what you want —
@@ -124,8 +124,8 @@ run with `SDL_VIDEODRIVER=terminal`, or pass them through `dos`.
 | Variable | Values | Effect |
 |---|---|---|
 | `SDL_VIDEODRIVER` | `terminal` | Selects this driver. Required. |
-| `SDL_TERMINAL_ASPECT` | `W:H` (`4:3`, `16:9`, `5:4`) or a decimal (`1.6`) | Forces the display aspect (legacy cell box, and the fullscreen OSC 2501 `ar`). Unset ⇒ DOSBox's per-mode aspect (`DOSBOX_DISPLAY_ASPECT` hint, ~4:3 for DOS); unparseable ⇒ native pixel ratio. |
-| `SDL_TERMINAL_SCALE` | `N` (integer ≥ 1) | Fullscreen only: present the guest at a **fixed integer device-pixel scale** (OSC 2501 `fit=scale;scale=N`) instead of stretch/contain — crisp integer magnification for **square-pixel guests like Windows**, not fill-to-screen. On a 2× Retina display `scale=3` renders at 1.5× logical size. Overrides `SDL_TERMINAL_ASPECT`; needs terminal `fit=scale` support. |
+| `SDL_TERMINAL_ASPECT` | `W:H` (`4:3`, `16:9`, `5:4`) or a decimal (`1.6`) | Forces the display aspect (legacy cell box, and the fullscreen OSC 7402 `ar`). Unset ⇒ DOSBox's per-mode aspect (`DOSBOX_DISPLAY_ASPECT` hint, ~4:3 for DOS); unparseable ⇒ native pixel ratio. |
+| `SDL_TERMINAL_SCALE` | `N` (integer ≥ 1) | Fullscreen only: present the guest at a **fixed integer device-pixel scale** (OSC 7402 `fit=scale;scale=N`) instead of stretch/contain — crisp integer magnification for **square-pixel guests like Windows**, not fill-to-screen. On a 2× Retina display `scale=3` renders at 1.5× logical size. Overrides `SDL_TERMINAL_ASPECT`; needs terminal `fit=scale` support. |
 | `SDL_TERMINAL_FULLSCREEN` | `1` / `0` | Force Ubiquitty fullscreen-content mode (DECSET 7402) on / off. **Default: auto** — enabled when the terminal answers DECRQM for 7402. See below. |
 | `SDL_TERMINAL_ZLIB` | `1` / `0` | Force zlib payload compression (kitty `o=z`) on / off. **Default: auto** — enabled when the startup probe confirms `o=z` (and libz loads). See Performance below. |
 | `SDL_TERMINAL_XFER` | `shm` / `file` (or `t`) / anything else | Force kitty **shared-memory transport** (`t=s`), **file transport** (`t=t`), or base64. **Default: auto** — each is enabled when the startup probe confirms it; shared memory wins over file when both probe true. See Performance below. |
