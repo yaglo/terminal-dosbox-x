@@ -38,8 +38,8 @@ the image stream.
 At startup the driver **probes the terminal** and turns on each optional feature
 only where it's supported — no flags needed. It sends:
 
-- **`DECRQM`** (`CSI ?2501$p`, `CSI ?2502$p`) to detect Ubiquitty's fullscreen
-  (2501) and mouselook (2502) private modes;
+- **`DECRQM`** (`CSI ?7402$p`, `CSI ?7403$p`) to detect Ubiquitty's fullscreen
+  (7402) and mouselook (7403) private modes;
 - a tiny **1×1 kitty transmit** over `t=t` (file transport), `t=s` (shared
   memory), and one with `o=z` (zlib), reading the `;OK`/`;E…` ACK to detect each;
 - a trailing **Primary DA** (`CSI c`) as a guaranteed terminator so the probe
@@ -72,9 +72,9 @@ within about one cell (≈1% on a normal-size grid). The residual bars are fille
 by the terminal's background. For a pixel-perfect, edge-to-edge, solid-black
 letterbox, use fullscreen mode:
 
-## Fullscreen (Ubiquitty DECSET 2501)
+## Fullscreen (Ubiquitty DECSET 7402)
 
-**Auto-enabled** when the terminal supports DECSET 2501 (detected via DECRQM at
+**Auto-enabled** when the terminal supports DECSET 7402 (detected via DECRQM at
 startup). Force it with `SDL_TERMINAL_FULLSCREEN=1`, or off with `=0`.
 
 In fullscreen the terminal zeroes its padding, fits the frame to the whole window
@@ -87,9 +87,12 @@ To correct DOS's non-square pixels (320×200 is drawn for 4:3, not its raw 8:5),
 the driver declares the intended display aspect to the terminal via **OSC 2501**
 (`fit=stretch;ar=W:H`), taken from DOSBox's per-mode aspect — so text and graphics
 modes each display at the right shape and flip automatically as the guest changes
-modes. On a 2501 terminal that lacks the display-aspect knob, the `ar` is ignored
-and the frame shows at its native pixel ratio instead. The driver emits `?2501h`
-on start (when enabled) and `?2501l` on exit.
+modes. Note that **OSC 2501 is not DECSET 7402** — an OSC is a different
+namespace from a private mode number, so it collides with nothing and kept its
+number when the modes moved into the 7400 block. On a terminal that implements
+7402 but lacks the display-aspect knob, the `ar` is ignored and the frame shows
+at its native pixel ratio instead. The driver emits `?7402h` on start (when
+enabled) and `?7402l` on exit.
 
 For **square-pixel guests like Windows**, stretch-to-fill isn't what you want —
 set `SDL_TERMINAL_SCALE=N` for a fixed integer magnification (`fit=scale;scale=N`),
@@ -103,14 +106,14 @@ games move the guest cursor), DOSBox has to **capture** the mouse first — and 
 only does that when its mouse is *locked*. `dos` runs with `autolock=true`, so
 once a game or Windows grabs the mouse, **click once in the window** (or press
 **Ctrl-F10**) to capture. At that point DOSBox switches SDL into relative mode and
-the driver enters the terminal's **pointer-lock** (Ubiquitty DECSET 2502): the
+the driver enters the terminal's **pointer-lock** (Ubiquitty DECSET 7403): the
 terminal hides and confines the OS cursor and reports relative deltas, which the
 driver feeds to the game. On Ubiquitty, **hold ⌃⌘** to break out and get your
 cursor back.
 
 Note: DOSBox-X defaults `autolock` to *off*, so without it (a bare
 `SDL_VIDEODRIVER=terminal src/dosbox-x …`) a click won't capture — only Ctrl-F10
-will. Requires a terminal that implements DECSET 2502 for the relative path;
+will. Requires a terminal that implements DECSET 7403 for the relative path;
 absolute mouse works everywhere regardless.
 
 ## Environment variables
@@ -123,7 +126,7 @@ run with `SDL_VIDEODRIVER=terminal`, or pass them through `dos`.
 | `SDL_VIDEODRIVER` | `terminal` | Selects this driver. Required. |
 | `SDL_TERMINAL_ASPECT` | `W:H` (`4:3`, `16:9`, `5:4`) or a decimal (`1.6`) | Forces the display aspect (legacy cell box, and the fullscreen OSC 2501 `ar`). Unset ⇒ DOSBox's per-mode aspect (`DOSBOX_DISPLAY_ASPECT` hint, ~4:3 for DOS); unparseable ⇒ native pixel ratio. |
 | `SDL_TERMINAL_SCALE` | `N` (integer ≥ 1) | Fullscreen only: present the guest at a **fixed integer device-pixel scale** (OSC 2501 `fit=scale;scale=N`) instead of stretch/contain — crisp integer magnification for **square-pixel guests like Windows**, not fill-to-screen. On a 2× Retina display `scale=3` renders at 1.5× logical size. Overrides `SDL_TERMINAL_ASPECT`; needs terminal `fit=scale` support. |
-| `SDL_TERMINAL_FULLSCREEN` | `1` / `0` | Force Ubiquitty fullscreen-content mode (DECSET 2501) on / off. **Default: auto** — enabled when the terminal answers DECRQM for 2501. See below. |
+| `SDL_TERMINAL_FULLSCREEN` | `1` / `0` | Force Ubiquitty fullscreen-content mode (DECSET 7402) on / off. **Default: auto** — enabled when the terminal answers DECRQM for 7402. See below. |
 | `SDL_TERMINAL_ZLIB` | `1` / `0` | Force zlib payload compression (kitty `o=z`) on / off. **Default: auto** — enabled when the startup probe confirms `o=z` (and libz loads). See Performance below. |
 | `SDL_TERMINAL_XFER` | `shm` / `file` (or `t`) / anything else | Force kitty **shared-memory transport** (`t=s`), **file transport** (`t=t`), or base64. **Default: auto** — each is enabled when the startup probe confirms it; shared memory wins over file when both probe true. See Performance below. |
 | `SDL_TERMINAL_OUT` | path | Write the Kitty/escape stream to a file instead of `/dev/tty` (debug capture). |
