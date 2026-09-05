@@ -2234,7 +2234,7 @@ bool intensity_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const me
     (void)menu;//UNUSED
     const char *mname = menuitem->get_name().c_str();
     uint16_t oldax=reg_ax, oldbx=reg_bx;
-    if (IS_PC98_ARCH||machine==MCH_CGA||(CurMode->mode>7&&CurMode->mode!=0x0019&&CurMode->mode!=0x0043&&CurMode->mode!=0x0054&&CurMode->mode!=0x0055&&CurMode->mode!=0x0064)) {
+    if (IS_PC98_ARCH||machine==MCH_CGA||machine==MCH_OLIVETTI||machine==MCH_3270PC||(CurMode->mode>7&&CurMode->mode!=0x0019&&CurMode->mode!=0x0043&&CurMode->mode!=0x0054&&CurMode->mode!=0x0055&&CurMode->mode!=0x0064)) {
         systemmessagebox("Warning", MSG_Get("MENU_HIGH_INTENSITY_ERROR"), "ok","warning", 1);
         return true;
     }
@@ -3706,6 +3706,13 @@ void AllocCallback1() {
                 mainMenu.alloc_item(DOSBoxMenu::item_type_id,"capture_fmt_avi_zmbv").set_text("AVI + ZMBV").
                     set_callback_function(capture_fmt_menu_callback);
                 mainMenu.alloc_item(DOSBoxMenu::item_type_id,"capture_fmt_mpegts_h264").set_text("MPEG-TS + H.264").
+                    set_callback_function(capture_fmt_menu_callback).
+#  if (C_AVCODEC)
+                enable(true);
+#  else
+                enable(false);
+#  endif
+                mainMenu.alloc_item(DOSBoxMenu::item_type_id,"capture_fmt_mpegts_h265").set_text("MPEG-TS + H.265").
                     set_callback_function(capture_fmt_menu_callback).
 #  if (C_AVCODEC)
                 enable(true);

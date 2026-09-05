@@ -98,6 +98,7 @@ static Bitu INT2F_Handler(void) {
 		if( (*it)() ) return CBRET_NONE;
    
 	LOG(LOG_DOSMISC,LOG_DEBUG)("DOS:INT 2F Unhandled call AX=%4X",reg_ax);
+
 	return CBRET_NONE;
 }
 

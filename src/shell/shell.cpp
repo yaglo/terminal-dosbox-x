@@ -77,6 +77,10 @@ uint16_t shell_psp = 0;
 Bitu call_int2e = 0;
 Bitu call_int23 = 0;
 
+uint16_t DOS_ShellGetPSP() {
+	return shell_psp;
+}
+
 std::string GetDOSBoxXPath(bool withexe=false);
 const char* DOS_GetLoadedLayout(void);
 Bitu DOS_ChangeKeyboardLayout(const char* layoutname, int32_t codepage), DOS_SwitchKeyboardLayout(const char* new_layout, int32_t& tried_cp);
@@ -931,7 +935,7 @@ void showWelcome(Program *shell) {
         if (IS_DOSV) {
             shell->WriteOut(ParseMsg((std::string("\033[44;1m\xBA ")+str_replace(MSG_Get("SHELL_STARTUP_DOSV"), "\n", " \xBA\033[0m\033[44;1m\xBA ")+std::string(" \xBA\033[0m")).c_str()));
             shell->WriteOut(ParseMsg("\033[44;1m\xBA                                                                              \xBA\033[0m"));
-        } else if (machine == MCH_CGA || machine == MCH_PCJR || machine == MCH_AMSTRAD) {
+        } else if (machine == MCH_CGA || machine == MCH_PCJR || machine == MCH_AMSTRAD || machine == MCH_OLIVETTI || machine == MCH_3270PC) {
             shell->WriteOut(ParseMsg((std::string("\033[44;1m\xBA ")+str_replace(MSG_Get(mono_cga?"SHELL_STARTUP_CGA_MONO":"SHELL_STARTUP_CGA"), "\n", " \xBA\033[0m\033[44;1m\xBA ")+std::string(" \xBA\033[0m")).c_str()));
             shell->WriteOut(ParseMsg("\033[44;1m\xBA                                                                              \xBA\033[0m"));
         } else if (machine == MCH_HERC || machine == MCH_MDA) {
@@ -2052,11 +2056,6 @@ void SHELL_Init() {
 		DOS_SetMemAllocStrategy(savedMemAllocStrategy | 0x80);
 	}
 
-	// COMMAND.COM environment block
-	tmp = dosbox_shell_env_size>>4;
-	if (!DOS_AllocateMemory(&env_seg,&tmp)) E_Exit("COMMAND.COM failed to allocate environment block segment");
-	LOG_MSG("COMMAND.COM environment block:    0x%04x sz=0x%04x",env_seg,tmp);
-
 	// COMMAND.COM main binary (including PSP and stack)
 	if (tiny_memory_mode)
 		tmp = 0x13 + (1536/16);
@@ -2073,6 +2072,13 @@ void SHELL_Init() {
 	}
 
 	LOG_MSG("COMMAND.COM main body (PSP):      0x%04x sz=0x%04x",psp_seg,tmp);
+
+	// COMMAND.COM environment block
+	// Allocate the environment after the shell body/PSP so the MCB chain and
+	// ownership layout matches DOS expectations for COMMAND.COM.
+	tmp = dosbox_shell_env_size>>4;
+	if (!DOS_AllocateMemory(&env_seg,&tmp)) E_Exit("COMMAND.COM failed to allocate environment block segment");
+	LOG_MSG("COMMAND.COM environment block:    0x%04x sz=0x%04x",env_seg,tmp);
 
 	DOS_SetMemAllocStrategy(savedMemAllocStrategy);
 
@@ -2335,6 +2341,7 @@ void DOS_ConfigShell::Run(void) {
 			const char *e = cfgstr;
 			while (e > b && *(e-1) == ' ') e--;
 			name = std::string(b,size_t(e-b));
+			for (auto &c : name) c = toupper(c);
 		}
 
 		if (*cfgstr == '=') {
@@ -2528,11 +2535,6 @@ void CONFIGSHELL_Init() {
 	auto savedMemAllocStrategy = DOS_GetMemAllocStrategy();
 	DOS_SetMemAllocStrategy(2/*last fit*/);
 
-	// COMMAND.COM environment block
-	tmp = dosbox_shell_env_size>>4;
-	if (!DOS_AllocateMemory(&env_seg,&tmp)) E_Exit("COMMAND.COM failed to allocate environment block segment");
-	LOG_MSG("COMMAND.COM environment block:    0x%04x sz=0x%04x",env_seg,tmp);
-
 	// COMMAND.COM main binary (including PSP and stack)
 	if (tiny_memory_mode)
 		tmp = 0x13 + (1536/16);
@@ -2550,6 +2552,14 @@ void CONFIGSHELL_Init() {
 
 	LOG_MSG("COMMAND.COM main body (PSP):      0x%04x sz=0x%04x",psp_seg,tmp);
 
+	// COMMAND.COM environment block
+	// Keep the same allocation order as SHELL_Init(): allocate environment
+	// after shell body/PSP so config-phase COMMAND.COM has expected MCB layout
+	// for DOS-era software that scans ownership via MCB traversal.
+	tmp = dosbox_shell_env_size>>4;
+	if (!DOS_AllocateMemory(&env_seg,&tmp)) E_Exit("COMMAND.COM failed to allocate environment block segment");
+	LOG_MSG("COMMAND.COM environment block:    0x%04x sz=0x%04x",env_seg,tmp);
+
 	DOS_SetMemAllocStrategy(savedMemAllocStrategy);
 
 	// now COMMAND.COM has a main body and PSP segment, reflect it
@@ -2559,13 +2569,13 @@ void CONFIGSHELL_Init() {
 	{
 		DOS_MCB mcb((uint16_t)(env_seg-1));
 		mcb.SetPSPSeg(psp_seg);
-		mcb.SetFileName("CONFIG");
+		mcb.SetFileName("CFGSHELL");
 	}
 
 	{
 		DOS_MCB mcb((uint16_t)(psp_seg-1));
 		mcb.SetPSPSeg(psp_seg);
-		mcb.SetFileName("CONFIG");
+		mcb.SetFileName("CFGSHELL");
 	}
 
 	// set the stack at 0x1A

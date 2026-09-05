@@ -76,6 +76,8 @@ extern std::string log_dev_con_str;
 extern bool use_quick_reboot;
 #if !defined(OSFREE)
 extern bool j3100_start;
+unsigned int extdev_read_limit = 0;
+unsigned int extdev_write_limit = 0;
 #endif
 extern bool enable_config_as_shell_commands;
 extern bool checkwat, loadlang, pcibus_enable;
@@ -4227,6 +4229,9 @@ public:
 						dos.version.major, dos.version.minor);
 			}
 		}
+
+		::extdev_read_limit = section->Get_int("ext dev read limit");
+		::extdev_write_limit = section->Get_int("ext dev write limit");
 #endif
 
 		::disk_data_rate = section->Get_int("hard drive data rate limit");
@@ -4769,8 +4774,10 @@ public:
 
 		LOG(LOG_DOSMISC,LOG_DEBUG)("   min free:     seg 0x%04x",minimum_mcb_free);
 
-#if C_IPX
+#if !defined(OSFREE)
+# if C_IPX
 		IPX_Setup(NULL);
+# endif
 #endif
 
 		DOS_SetupPrograms();

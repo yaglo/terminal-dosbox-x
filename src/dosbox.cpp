@@ -52,6 +52,7 @@
 #include <ctime>
 #include <unistd.h>
 #include "dosbox.h"
+#include "agent/agent_bridge.h"
 #include "debug.h"
 #include "cpu.h"
 #include "logging.h"
@@ -466,6 +467,7 @@ static Bitu Normal_Loop(void) {
 
     try {
         while (1) {
+            dosbox_agent::AGENT_BridgePump();
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
                 CPU_Check_NMI();
@@ -737,6 +739,8 @@ volatile int runmachine_recursion = 0;
 
 void DOSBOX_RunMachine(void){
     Bitu ret;
+
+    dosbox_agent::AGENT_BridgeAttachToCurrentThread();
 
     extern unsigned int last_callback;
     unsigned int p_last_callback = last_callback;
@@ -1272,6 +1276,11 @@ void DOSBOX_RealInit() {
     else if (mtype == "svga_paradise") { svgaCard = SVGA_ParadisePVGA1A; }
     else if (mtype == "vgaonly")       { svgaCard = SVGA_None; }
     else if (mtype == "amstrad")       { machine = MCH_AMSTRAD; }
+    else if (mtype == "olivetti")      { machine = MCH_OLIVETTI; mono_cga = false; } /* Olivetti M24 / AT&T 6300 OGC */
+    else if (mtype == "m24")           { machine = MCH_OLIVETTI; mono_cga = false; } /* alias */
+    else if (mtype == "att6300")       { machine = MCH_OLIVETTI; mono_cga = false; } /* alias */
+    else if (mtype == "pc3270")        { machine = MCH_3270PC; mono_cga = false; } /* IBM 3270 PC (5271) */
+    else if (mtype == "3270pc")        { machine = MCH_3270PC; mono_cga = false; } /* alias */
     else if (mtype == "pc98")          { machine = MCH_PC98; }
     else if (mtype == "pc9801")        { machine = MCH_PC98; } /* Future differentiation */
     else if (mtype == "pc9821")        { machine = MCH_PC98; } /* Future differentiation */
@@ -1422,7 +1431,7 @@ void DOSBOX_SetupConfigSections(void) {
     const char* cyclest[] = { "auto","fixed","max","%u", nullptr };
     const char* mputypes[] = { "intelligent", "uart", "none", nullptr };
     const char* vsyncmode[] = { "off", "on" ,"force", "host", nullptr };
-    const char* captureformats[] = { "default", "avi-zmbv", "mpegts-h264", nullptr };
+    const char* captureformats[] = { "default", "avi-zmbv", "mpegts-h264", "mpegts-h265", nullptr };
     const char* blocksizes[] = {"1024", "2048", "4096", "8192", "512", "256", nullptr };
     const char* capturechromaformats[] = { "auto", "4:4:4", "4:2:2", "4:2:0", nullptr };
     const char* controllertypes[] = { "auto", "at", "xt", "pcjr", "pc98", nullptr }; // Future work: Tandy(?) and USB
@@ -1525,6 +1534,8 @@ void DOSBOX_SetupConfigSections(void) {
         "tandy",
         "pcjr", "pcjr_composite", "pcjr_composite2",
         "amstrad",
+        "olivetti", "m24", "att6300",
+        "pc3270", "3270pc",
         "ega",
         "ega200",
         "jega",
@@ -1814,7 +1825,9 @@ void DOSBOX_SetupConfigSections(void) {
             "default                     Use compiled-in default (avi-zmbv)\n"
             "avi-zmbv                    Use DOSBox-style AVI + ZMBV codec with PCM audio\n"
             "mpegts-h264                 Use MPEG transport stream + H.264 + AAC audio. Resolution & refresh rate changes can be contained\n"
-            "                            within one file with this choice, however not all software can support mid-stream format changes.");
+            "                            within one file with this choice, however not all software can support mid-stream format changes.\n"
+            "mpegts-h265                 Use MPEG transport stream + H.265 + AAC audio. Resolution & refresh rate changes handled same as h264"
+            );
 
     Pint = secprop->Add_int("shell environment size",Property::Changeable::OnlyAtStart,0);
     Pint->SetMinMax(0,65280);
@@ -4378,10 +4391,13 @@ void DOSBOX_SetupConfigSections(void) {
         "                 (realport:COM1 realport:ttyS0).\n"
         "for modem: listenport (optional).\n"
         "for nullmodem: server, rxdelay, txdelay, telnet, usedtr,\n"
-        "               transparent, port, inhsocket, sock, nonlocal (all optional).\n"
+        "               transparent, port, inhsocket, sock, pipe, nonlocal (all optional).\n"
         "               connections are limited to localhost unless you specify nonlocal:1\n"
-        "               \"sock\" parameter specifies the protocol to be used by both sides\n"
-        "               of the connection. 0 for TCP and 1 for ENet reliable UDP.\n"
+        "               \"sock\" parameter specifies the transport used by both sides of\n"
+        "               the connection. 0 for TCP, 1 for ENet reliable UDP, 2 for a local\n"
+        "               named pipe / UNIX socket (lowest latency, same host only). With\n"
+        "               sock:2 the endpoint is a path: server:<path> as a client, or\n"
+        "               pipe:<path> as a server.\n"
         "Example: serial1=modem listenport:5000 sock:1\n"
         "Note: COM1-4 are standard COM ports in DOS, whereas COM5-9 are extended COM ports.\n"
         "      You can optionally specify base addresses and IRQs for them with base: and irq: options.\n"
@@ -4479,6 +4495,8 @@ void DOSBOX_SetupConfigSections(void) {
             "   file (records data to a file or passes it to a device),\n"
             "   printer (virtual dot-matrix printer, see [printer] section)\n"
             "       disney (attach Disney Sound Source emulation to this port)\n"
+            "   extlpt (raw bit-bang LPT passthrough to an external process\n"
+            "           over a local named pipe / UNIX socket)\n"
             "Additional parameters must be in the same line in the form of\n"
             "parameter:value.\n"
             "  for reallpt:\n"
@@ -4506,6 +4524,19 @@ void DOSBOX_SetupConfigSections(void) {
             "  Example: parallel1=file file:output1.prn timeout:1000 openpcl:pcl6 openps:gswin32c openwith:notepad\n"
             "  for printer:\n"
             "    printer still has its own configuration section above.\n"
+            "  for extlpt:\n"
+            "    transport:<t> pipe (default) or tcp.\n"
+            "    pipe:<name> transport:pipe - path (default \\\\.\\pipe\\dosbox_lpt\n"
+            "      on Windows, /tmp/dosbox_lpt elsewhere).\n"
+            "    host:<h> / port:<n> transport:tcp - host (default 127.0.0.1)\n"
+            "      and TCP port. tcp needs a build with modem support.\n"
+            "    server: DOSBox-X creates the endpoint and waits for the\n"
+            "      external process to connect (default: connects as client).\n"
+            "    registers:<data,status,control> subset of LPT registers wired\n"
+            "      to the external device; the rest go to the printer engine.\n"
+            "    maskdata:<XX> / maskcontrol:<XX> hex bitmask, independent per\n"
+            "      register; only round-trip a write to that register when its\n"
+            "      masked bits actually changed.\n"
             "Note: LPT1-3 are standard LPT ports in DOS, whereas LPT4-9 are extended LPT ports.\n"
             "      You can optionally specify base addresses and IRQs for them with base: and irq: options.\n"
             "      Parallel port settings can also be changed via the built-in PARALLEL command."
@@ -4619,6 +4650,14 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool = secprop->Add_bool("xms",Property::Changeable::WhenIdle,true);
     Pbool->Set_help("Enable XMS support.");
     Pbool->SetBasic(true);
+
+    Pint = secprop->Add_int("ext dev read limit",Property::Changeable::WhenIdle,0);
+    Pint->Set_help("If nonzero, limit device reads to this many bytes. If the device driver cannot handle anything other than single-byte reads, set this to 1");
+    Pint->SetBasic(true);
+
+    Pint = secprop->Add_int("ext dev write limit",Property::Changeable::WhenIdle,0);
+    Pint->Set_help("If nonzero, limit device writes to this many bytes. If the device driver cannot handle anything other than single-byte writes, set this to 1");
+    Pint->SetBasic(true);
 
     /* maybe this will stop the endless "it's broken and it only works once you point out LOADFIX -a" bug reports */
     Pbool = secprop->Add_bool("turn off a20 gate on load if loadfix needed",Property::Changeable::WhenIdle,false);
